@@ -39,7 +39,6 @@ def get_market_data(base_rate, shock_bps):
     # Curve Construction:
     # 1. Slope: -3bps per month (Inverted)
     # 2. Convexity: Small quadratic term so the curve isn't a perfect straight line.
-    #    This ensures Fly prices are not exactly 0.000.
     slope = -0.03
     convexity = 0.0005 
     
@@ -119,7 +118,7 @@ if view_mode == "Market Overview":
         st.dataframe(df[['Month', 'ZQ_Price', 'SR3_Price']], hide_index=True, use_container_width=True, height=450)
 
 # -----------------------------------------------------------------------------
-# MODE 2: STRATEGY LAB (UPDATED RISK ENGINE)
+# MODE 2: STRATEGY LAB (PRO RISK ENGINE)
 # -----------------------------------------------------------------------------
 elif view_mode == "Strategy Lab":
     st.subheader("🛠️ Strategy Constructor")
@@ -168,15 +167,16 @@ elif view_mode == "Strategy Lab":
             
         st.dataframe(pd.DataFrame(tick_data), hide_index=True, use_container_width=True)
         st.metric("Package Price", f"{pkg_price:.3f}")
+
+        # --- PRO RISK METRICS ---
         st.markdown("---")
-        st.markdown("#### 📊 Risk Sensitivity")
+        st.markdown("#### 📊 Sensitivity")
         
-        # Calculate Net DV01 (Sensitivity to 1bp parallel move)
+        # Calculate Net DV01
         net_dv01 = 0
         current_dv01_per_lot = DV01_MAP[prod]
         
         for leg in legs:
-            # Leg PnL = Qty * Lots * (-1bp move) * DV01_Value
             leg_risk = (leg['Qty'] * lots) * -1 * current_dv01_per_lot
             net_dv01 += leg_risk
             
@@ -194,42 +194,43 @@ elif view_mode == "Strategy Lab":
             r_color = "inverse"
         
         c_r2.metric("Bias", risk_type, delta=f"{net_dv01:.0f}", delta_color=r_color)
+
     with c_risk:
         st.markdown("#### ⚠️ Risk Simulation")
-        sim_mode = st.radio("Mode", ["Parallel Shift", "Curve Twist (Steepener)"], horizontal=True)
+        sim_mode = st.radio("Mode", ["Parallel Shift", "Curve Twist (Centered)"], horizontal=True)
         
         moves = np.arange(-25, 26, 1)
         pnl_vals = []
-        dv01 = DV01_MAP[prod]
-        # 3. Calculate "Center of Gravity" for the trade
-        # This fixes the skew by pivoting around the middle of the structure
-        center_index = (len(legs) - 1) / 2 
-
+        
+        # Center of Gravity for Twist
+        center_index = (len(legs) - 1) / 2
+        
         for m in moves:
             run_pnl = 0
             for i, leg in enumerate(legs):
-                # Get the DV01 for this specific contract
-                leg_dv01 = DV01_MAP[prod] 
+                leg_dv01 = DV01_MAP[prod]
                 
                 if sim_mode == "Parallel Shift":
-                    # Every leg moves the same amount 'm'
                     shift = m
                 else:
-                    # Curve Twist (Centered Pivot)
-                    # Front legs move DOWN, Back legs move UP (if m > 0)
+                    # Centered Twist Logic
                     dist_from_center = i - center_index
                     shift = m * dist_from_center
                 
-        # 4. Plot the results (Using Plotly for professional grids)
+                # PnL Calc
+                leg_pnl = -1 * shift * leg_dv01 * (leg['Qty'] * lots)
+                run_pnl += leg_pnl
+            
+            pnl_vals.append(round(run_pnl, 2))
+            
+        # Plotly Chart
         fig = go.Figure()
-        
         fig.add_trace(go.Scatter(
             x=moves, y=pnl_vals, 
             fill='tozeroy', name='PnL',
             line=dict(color='#4CAF50' if pnl_vals[-1] >= 0 else '#F44336', width=3)
         ))
         
-        # Add a fixed Zero Line (Visual Reference)
         fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
 
         fig.update_layout(
@@ -240,19 +241,10 @@ elif view_mode == "Strategy Lab":
             height=350,
             margin=dict(l=20, r=20, t=40, b=20)
         )
-        
         st.plotly_chart(fig, use_container_width=True)
         
-        # Professional Success Badge
         if sim_mode == "Curve Twist (Centered)" and abs(pnl_vals[-1]) == 0:
              st.success("✅ Strategy is Perfectly Hedged against Curve Rotation.")
-            
-            pnl_vals.append(round(run_pnl, 2))
-            
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=moves, y=pnl_vals, fill='tozeroy', line=dict(color='#4CAF50' if pnl_vals[-1]>=0 else '#F44336')))
-        fig.update_layout(title=f"PnL vs {sim_mode}", xaxis_title="Move (bps)", yaxis_title="PnL ($)", template="plotly_dark", height=300)
-        st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # MODE 3: SPREAD MATRIX
