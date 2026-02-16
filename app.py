@@ -168,7 +168,32 @@ elif view_mode == "Strategy Lab":
             
         st.dataframe(pd.DataFrame(tick_data), hide_index=True, use_container_width=True)
         st.metric("Package Price", f"{pkg_price:.3f}")
-
+        st.markdown("---")
+        st.markdown("#### 📊 Risk Sensitivity")
+        
+        # Calculate Net DV01 (Sensitivity to 1bp parallel move)
+        net_dv01 = 0
+        current_dv01_per_lot = DV01_MAP[prod]
+        
+        for leg in legs:
+            # Leg PnL = Qty * Lots * (-1bp move) * DV01_Value
+            leg_risk = (leg['Qty'] * lots) * -1 * current_dv01_per_lot
+            net_dv01 += leg_risk
+            
+        c_r1, c_r2 = st.columns(2)
+        c_r1.metric("Net DV01 ($)", f"${net_dv01:,.0f}")
+            
+        if abs(net_dv01) < (lots * 5): 
+            risk_type = "Neutral"
+            r_color = "off"
+        elif net_dv01 > 0:
+            risk_type = "Bullish"
+            r_color = "normal"
+        else:
+            risk_type = "Bearish"
+            r_color = "inverse"
+        
+        c_r2.metric("Bias", risk_type, delta=f"{net_dv01:.0f}", delta_color=r_color)
     with c_risk:
         st.markdown("#### ⚠️ Risk Simulation")
         sim_mode = st.radio("Mode", ["Parallel Shift", "Curve Twist (Steepener)"], horizontal=True)
