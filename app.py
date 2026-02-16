@@ -15,18 +15,23 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Clean CSS to fix "Black Box" issue and standardise font sizes
 st.markdown("""
 <style>
-    .stMetric { background-color: #121212; border: 1px solid #333; padding: 10px; border-radius: 4px; }
-    div[data-testid="stMetricValue"] { font-size: 1.2rem !important; color: #E0E0E0; }
-    div[data-testid="stMetricLabel"] { font-size: 0.8rem !important; }
+    /* Clean Metric Styling */
+    [data-testid="stMetricValue"] {
+        font-size: 1.5rem !important;
+    }
+    /* Compact Tables */
+    [data-testid="stDataFrame"] { 
+        width: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 2. CONSTANTS & UTILS
 # -----------------------------------------------------------------------------
-# 2026 FOMC Schedule
 FOMC_MEETINGS_2026 = [
     date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6), 
     date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
@@ -39,23 +44,13 @@ MONTH_CODES = {
 }
 
 # DV01 Constants ($ per bp per contract)
-DV01 = {
-    "ZQ": 41.67,
-    "SR1": 41.67,
-    "SR3": 25.00
-}
+DV01 = {"ZQ": 41.67, "SR1": 41.67, "SR3": 25.00}
 
 def get_days_in_month(dt):
     return calendar.monthrange(dt.year, dt.month)[1]
 
-def get_fomc_weights(contract_date):
-    meeting = next((m for m in FOMC_MEETINGS_2026 if m.year == contract_date.year and m.month == contract_date.month), None)
-    if not meeting: return (1.0, 0.0)
-    dim = get_days_in_month(contract_date)
-    return (meeting.day / dim, (dim - meeting.day) / dim)
-
 # -----------------------------------------------------------------------------
-# 3. DATA ENGINE (Robust)
+# 3. DATA ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data
 def get_curve_data(base_rate, shock_bps):
@@ -63,7 +58,7 @@ def get_curve_data(base_rate, shock_bps):
     data = []
     slope = -0.03
     
-    for i in range(18):
+    for i in range(24): # Extended to 2 years for Condors
         f_date = today + timedelta(days=30*i)
         if f_date < today: continue
         
@@ -71,28 +66,27 @@ def get_curve_data(base_rate, shock_bps):
         yc = str(f_date.year)[-1]
         suffix = f"{mc}{yc}"
         
-        # 1. Rates Logic
+        # Rate Logic
         raw_rate = base_rate + (i * slope) 
-        final_effr = raw_rate + (shock_bps/100) # Apply Shock
+        final_effr = raw_rate + (shock_bps/100) 
         sofr_rate = final_effr - 0.05
         
-        # 2. Pricing
+        # Pricing
         zq_price = 100 - final_effr
         sr1_price = 100 - sofr_rate
         sr3_price = 100 - (sofr_rate + 0.02)
 
         data.append({
+            "Label": f"{suffix} ({f_date.strftime('%b')})",
             "Month": f_date.strftime("%b %y"),
             "Suffix": suffix,
             "Date": f_date,
-            # Prices
-            "ZQ": round(zq_price, 3),
-            "SR1": round(sr1_price, 3),
-            "SR3": round(sr3_price, 3),
-            # Rates
-            "ZQ_Rate": round(100-zq_price, 3),
-            "SR1_Rate": round(100-sr1_price, 3),
-            "SR3_Rate": round(100-sr3_price, 3)
+            "ZQ": zq_price,
+            "SR1": sr1_price,
+            "SR3": sr3_price,
+            "ZQ_Rate": 100-zq_price,
+            "SR1_Rate": 100-sr1_price,
+            "SR3_Rate": 100-sr3_price
         })
         
     return pd.DataFrame(data)
@@ -101,37 +95,34 @@ def get_curve_data(base_rate, shock_bps):
 # 4. SIDEBAR
 # -----------------------------------------------------------------------------
 st.sidebar.header("STIR Desk Controls")
-mode = st.sidebar.radio("Mode", ["Market Overview", "Custom Strategy Builder", "Spread Matrix"])
+mode = st.sidebar.radio("Workstation Mode", ["Market Overview", "Strategy Builder", "Spread Matrix"])
 
 st.sidebar.divider()
-st.sidebar.subheader("Global Curve Inputs")
-# FIX: Min value 0.0 to allow 3.64
+st.sidebar.subheader("Curve Assumptions")
 base_effr = st.sidebar.number_input("Base EFFR (%)", 0.0, 20.0, 3.64, 0.01)
+curve_shock = st.sidebar.slider("Parallel Shift (bps)", -50, 50, 0)
+tape_source = st.sidebar.selectbox("Tape Instrument", ["ZQ", "SR1", "SR3"])
 
-# FIX: Tooltip explanation
-curve_shock = st.sidebar.slider("Parallel Shift (bps)", -50, 50, 0, 
-    help="Stress Test: Shifts the entire Yield Curve up/down to simulate a market shock.")
-
-tape_source = st.sidebar.selectbox("Tape Source", ["ZQ", "SR1", "SR3"])
-
-# Load Data
 df = get_curve_data(base_effr, curve_shock)
 
 # -----------------------------------------------------------------------------
-# 5. HEADER & TAPE
+# 5. DASHBOARD HEADER (TAPE)
 # -----------------------------------------------------------------------------
 st.title("STIR Trading Dashboard")
-st.caption(f"Pricing: Synthetic Live | Effr: {base_effr}% | Shift: {curve_shock}bps")
 
-# Dynamic Tape
+# Dynamic Tape (First 6 contracts)
 cols = st.columns(6)
 for i in range(min(6, len(df))):
     row = df.iloc[i]
     val = row[tape_source]
-    rate = row[f"{tape_source}_Rate"]
+    chg = row[f"{tape_source}_Rate"] - base_effr
     with cols[i]:
-        st.metric(f"{tape_source}{row['Suffix']}", f"{val:.3f}", f"{rate:.2f}%")
-
+        st.metric(
+            label=f"{tape_source}{row['Suffix']}", 
+            value=f"{val:.3f}", 
+            delta=f"{chg:.2f} sprd", 
+            delta_color="inverse"
+        )
 st.divider()
 
 # -----------------------------------------------------------------------------
@@ -140,136 +131,203 @@ st.divider()
 if mode == "Market Overview":
     c1, c2 = st.columns([2, 1])
     with c1:
-        st.subheader("Forward Rates Structure")
+        st.subheader("Forward Term Structure")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df['Month'], y=df['ZQ_Rate'], name='ZQ (Fed Funds)', line=dict(color='#00F0FF', width=3)))
-        fig.add_trace(go.Scatter(x=df['Month'], y=df['SR1_Rate'], name='SR1 (1M SOFR)', line=dict(color='#FFE800', width=2, dash='dot')))
-        fig.add_trace(go.Scatter(x=df['Month'], y=df['SR3_Rate'], name='SR3 (3M SOFR)', line=dict(color='#FF8C00', width=2, dash='dash')))
-        fig.update_layout(template="plotly_dark", height=450, xaxis_title="Contract", yaxis_title="Implied Rate (%)")
+        fig.add_trace(go.Scatter(x=df['Month'], y=df['ZQ_Rate'], name='ZQ', line=dict(color='#00F0FF', width=3)))
+        fig.add_trace(go.Scatter(x=df['Month'], y=df['SR1_Rate'], name='SR1', line=dict(color='#FFE800', width=2, dash='dot')))
+        fig.add_trace(go.Scatter(x=df['Month'], y=df['SR3_Rate'], name='SR3', line=dict(color='#FF8C00', width=2, dash='dash')))
+        fig.update_layout(template="plotly_dark", height=500, xaxis_title="Contract", yaxis_title="Implied Rate (%)", margin=dict(l=20, r=20, t=40, b=20))
         st.plotly_chart(fig, use_container_width=True)
+    
     with c2:
-        st.subheader("Live Quotes")
-        st.dataframe(df[['Month', 'ZQ', 'SR1', 'SR3']], hide_index=True, use_container_width=True, height=450)
-
-# -----------------------------------------------------------------------------
-# MODULE: CUSTOM STRATEGY BUILDER (Rebuilt)
-# -----------------------------------------------------------------------------
-elif mode == "Custom Strategy Builder":
-    st.subheader("🛠️ Custom Spread Builder")
-    
-    # --- LEG DEFINITION ---
-    c_leg1, c_mid, c_leg2 = st.columns([1, 0.2, 1])
-    
-    # Helper for dropdowns
-    contract_opts = [f"{r['Suffix']} ({r['Month']})" for i, r in df.iterrows()]
-    
-    with c_leg1:
-        st.markdown("#### Leg 1")
-        l1_action = st.selectbox("Action", ["BUY", "SELL"], key="l1_a")
-        l1_qty = st.number_input("Qty", 1, 5000, 100, key="l1_q")
-        l1_prod = st.selectbox("Product", ["ZQ", "SR1", "SR3"], key="l1_p")
-        l1_contract_str = st.selectbox("Contract", contract_opts, key="l1_c")
-        
-        # Parse Contract
-        l1_suffix = l1_contract_str.split(" ")[0]
-        l1_row = df[df['Suffix'] == l1_suffix].iloc[0]
-        l1_price = l1_row[l1_prod]
-        l1_sign = 1 if l1_action == "BUY" else -1
-        
-        st.metric(f"{l1_prod}{l1_suffix}", f"{l1_price:.3f}")
-
-    with c_mid:
-        st.markdown("<h2 style='text-align: center; padding-top: 80px;'>vs</h2>", unsafe_allow_html=True)
-
-    with c_leg2:
-        st.markdown("#### Leg 2")
-        l2_action = st.selectbox("Action", ["BUY", "SELL"], index=1, key="l2_a") # Default to Sell
-        l2_qty = st.number_input("Qty", 1, 5000, 100, key="l2_q")
-        l2_prod = st.selectbox("Product", ["ZQ", "SR1", "SR3"], key="l2_p") # Allow Cross Product!
-        l2_contract_str = st.selectbox("Contract", contract_opts, index=min(2, len(contract_opts)-1), key="l2_c")
-        
-        # Parse Contract
-        l2_suffix = l2_contract_str.split(" ")[0]
-        l2_row = df[df['Suffix'] == l2_suffix].iloc[0]
-        l2_price = l2_row[l2_prod]
-        l2_sign = 1 if l2_action == "BUY" else -1
-        
-        st.metric(f"{l2_prod}{l2_suffix}", f"{l2_price:.3f}")
-
-    st.divider()
-
-    # --- CALCULATIONS ---
-    # Net Price (Spread Price)
-    # Convention: (Leg1 * Qty) + (Leg2 * Qty). 
-    # Usually spreads are quoted 1:1, but here we sum the total cash value for PnL.
-    
-    net_dv01 = (l1_sign * l1_qty * DV01[l1_prod]) + (l2_sign * l2_qty * DV01[l2_prod])
-    
-    # Entry Price Diff
-    spread_price = (l1_price * l1_sign) + (l2_price * l2_sign) 
-    # If standard calendar spread (Buy A, Sell B), Price = A - B
-    
-    c_res1, c_res2 = st.columns([1, 2])
-    
-    with c_res1:
-        st.write("### Risk Profile")
-        st.metric("Net Package Price", f"{spread_price:.3f}")
-        
-        risk_color = "red" if abs(net_dv01) > 1000 else "green"
-        st.markdown(f"**Net DV01:** <span style='color:{risk_color}'>${net_dv01:,.2f}</span> / bp", unsafe_allow_html=True)
-        
-        if l1_prod != l2_prod:
-            st.info("⚠️ Inter-commodity Spread Detected (e.g. ZQ vs SR3)")
-        elif l1_suffix != l2_suffix:
-            st.info("📅 Calendar Spread Detected")
-
-    with c_res2:
-        st.write("### PnL Simulation (Curve Shift)")
-        
-        # Generate PnL Chart for Parallel Shifts
-        shifts = np.linspace(-50, 50, 21)
-        pnl_vals = []
-        
-        for s in shifts:
-            # PnL = -1 * Shift * DV01
-            # If Net DV01 is positive (Long Risk), and Rates go UP (+Shift), Price goes DOWN -> Loss.
-            # Formula: PnL = NetDV01 * -1 * (Shift/100) * 100 ?? 
-            # Simplified: DV01 is dollar val per 1bp change. 
-            # If Rates +10bps, Price -10 ticks. Long position loses.
-            # So PnL = NetDV01 * (Shift * -1)
-            pnl = net_dv01 * (-s) 
-            pnl_vals.append(pnl)
-            
-        fig_pnl = go.Figure()
-        fig_pnl.add_trace(go.Scatter(x=shifts, y=pnl_vals, fill='tozeroy', line=dict(color='#00F0FF')))
-        fig_pnl.update_layout(
-            title="PnL vs Market Rate Move (Parallel Shift)",
-            xaxis_title="Rate Shift (bps)",
-            yaxis_title="PnL ($)",
-            template="plotly_dark",
-            height=350
+        st.subheader("Live Prices")
+        st.dataframe(
+            df[['Suffix', 'ZQ', 'SR1', 'SR3']], 
+            column_config={
+                "ZQ": st.column_config.NumberColumn(format="%.3f"),
+                "SR1": st.column_config.NumberColumn(format="%.3f"),
+                "SR3": st.column_config.NumberColumn(format="%.3f")
+            },
+            hide_index=True, use_container_width=True, height=500
         )
-        st.plotly_chart(fig_pnl, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# MODULE: SPREAD MATRIX
+# MODULE: STRATEGY BUILDER (PRO)
+# -----------------------------------------------------------------------------
+elif mode == "Strategy Builder":
+    st.subheader("🛠️ Strategy Lab")
+    
+    # 1. Strategy Selector
+    strat_col, prod_col, qty_col = st.columns([2, 1, 1])
+    with strat_col:
+        strat_type = st.selectbox("Strategy Type", ["Calendar Spread", "Butterfly (Fly)", "Condor", "Custom"])
+    with prod_col:
+        prod_root = st.selectbox("Product", ["ZQ", "SR1", "SR3"])
+    with qty_col:
+        base_qty = st.number_input("Base Size (Lots)", 100, 10000, 100, 100)
+
+    # 2. Leg Generation Logic
+    legs = [] # Stores (Qty, Price, Name)
+    
+    contract_list = df['Label'].tolist()
+    
+    # --- AUTO-POPULATE LEGS BASED ON STRATEGY ---
+    if strat_type == "Calendar Spread":
+        c1, c2 = st.columns(2)
+        with c1:
+            front = st.selectbox("Front Leg", contract_list, index=0)
+        with c2:
+            back = st.selectbox("Back Leg", contract_list, index=1)
+        
+        # Add Legs: Buy Front / Sell Back
+        f_row = df[df['Label'] == front].iloc[0]
+        b_row = df[df['Label'] == back].iloc[0]
+        legs.append({"Side": "BUY", "Qty": 1 * base_qty, "Contract": f"{prod_root}{f_row['Suffix']}", "Price": f_row[prod_root]})
+        legs.append({"Side": "SELL", "Qty": -1 * base_qty, "Contract": f"{prod_root}{b_row['Suffix']}", "Price": b_row[prod_root]})
+
+    elif strat_type == "Butterfly (Fly)":
+        # Fly is Body - 2*Belly + Wing
+        c_belly, c_width = st.columns([2, 1])
+        with c_belly:
+            belly_label = st.selectbox("Belly (Center)", contract_list, index=2)
+        with c_width:
+            width = st.number_input("Wing Width (Months)", 1, 6, 1)
+            
+        belly_idx = df[df['Label'] == belly_label].index[0]
+        
+        # Validate indices
+        if belly_idx - width >= 0 and belly_idx + width < len(df):
+            w1_row = df.iloc[belly_idx - width]
+            b_row = df.iloc[belly_idx]
+            w2_row = df.iloc[belly_idx + width]
+            
+            legs.append({"Side": "BUY", "Qty": 1 * base_qty, "Contract": f"{prod_root}{w1_row['Suffix']}", "Price": w1_row[prod_root]})
+            legs.append({"Side": "SELL", "Qty": -2 * base_qty, "Contract": f"{prod_root}{b_row['Suffix']}", "Price": b_row[prod_root]})
+            legs.append({"Side": "BUY", "Qty": 1 * base_qty, "Contract": f"{prod_root}{w2_row['Suffix']}", "Price": w2_row[prod_root]})
+        else:
+            st.error(f"Strategy out of bounds. Select a belly contract at least {width} months from start/end.")
+
+    elif strat_type == "Condor":
+        # Condor is +1, -1, -1, +1 usually (Iron Condor structure in price space)
+        # Or Futures Condor: +1 A, -1 B, -1 C, +1 D
+        st.info("Structure: Buy A, Sell B, Sell C, Buy D (Equidistant)")
+        c_start, c_width = st.columns([2, 1])
+        with c_start:
+            start_label = st.selectbox("Front Wing (A)", contract_list, index=0)
+        with c_width:
+            width = st.number_input("Spacing (Months)", 1, 3, 1)
+            
+        start_idx = df[df['Label'] == start_label].index[0]
+        
+        if start_idx + (3*width) < len(df):
+            l1 = df.iloc[start_idx]
+            l2 = df.iloc[start_idx + width]
+            l3 = df.iloc[start_idx + width*2]
+            l4 = df.iloc[start_idx + width*3]
+            
+            legs.append({"Side": "BUY", "Qty": 1 * base_qty, "Contract": f"{prod_root}{l1['Suffix']}", "Price": l1[prod_root]})
+            legs.append({"Side": "SELL", "Qty": -1 * base_qty, "Contract": f"{prod_root}{l2['Suffix']}", "Price": l2[prod_root]})
+            legs.append({"Side": "SELL", "Qty": -1 * base_qty, "Contract": f"{prod_root}{l3['Suffix']}", "Price": l3[prod_root]})
+            legs.append({"Side": "BUY", "Qty": 1 * base_qty, "Contract": f"{prod_root}{l4['Suffix']}", "Price": l4[prod_root]})
+            
+    # --- CALCULATION ENGINE ---
+    if legs:
+        st.divider()
+        c_ticket, c_risk = st.columns([1, 1.5])
+        
+        # 1. Execution Ticket
+        with c_ticket:
+            st.markdown("#### 🎫 Ticket")
+            ticket_df = pd.DataFrame(legs)
+            ticket_df['Value'] = ticket_df['Qty'] * ticket_df['Price'] * DV01[prod_root] # Approx Notional
+            
+            # Display readable ticket
+            st.dataframe(
+                ticket_df[['Side', 'Contract', 'Qty', 'Price']], 
+                hide_index=True, 
+                use_container_width=True,
+                column_config={"Price": st.column_config.NumberColumn(format="%.3f")}
+            )
+            
+            net_price = sum([l['Price'] * (1 if l['Side']=="BUY" else -1) * (abs(l['Qty'])/base_qty) for l in legs])
+            # For Butterfly, Price is typically nearly 0 (e.g., 0.05). 
+            # If Qty is 1, -2, 1 -> Price = P1 - 2P2 + P3
+            
+            st.metric("Net Package Price", f"{net_price:.3f}")
+
+        # 2. Risk & Payoff
+        with c_risk:
+            st.markdown("#### ⚠️ Risk Analysis")
+            
+            # Scenario Analysis: Parallel Shift AND Curvature
+            # Parallel Shift (-20 to +20bps)
+            shifts = np.linspace(-25, 25, 51)
+            pnl_parallel = []
+            
+            # Curvature Shift (Belly moves, Wings stay) - mostly for Flys
+            pnl_curve = []
+            
+            # Calculate Risk Vectors
+            for s in shifts:
+                # Parallel PnL
+                run_pnl = 0
+                for leg in legs:
+                    # If rates UP (shift > 0), Price DOWN. 
+                    # Price Delta ~= -Shift. 
+                    # PnL = Qty * (PriceDelta) * DV01
+                    # Note: Qty is signed (+ for Buy, - for Sell)
+                    price_chg = -(s/100) # Simple duration approx
+                    run_pnl += leg['Qty'] * price_chg * DV01[prod_root]
+                pnl_parallel.append(run_pnl)
+
+            # Plotting
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=shifts, y=pnl_parallel, fill='tozeroy', name='Parallel Shift PnL', line=dict(color='#2ECC71')))
+            
+            fig.update_layout(
+                title="PnL vs Market Parallel Shift",
+                xaxis_title="Rate Move (bps)",
+                yaxis_title="PnL ($)",
+                template="plotly_dark",
+                height=350,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# MODULE: SPREAD MATRIX (FIXED)
 # -----------------------------------------------------------------------------
 elif mode == "Spread Matrix":
-    st.subheader("Calendar Spread Matrix")
-    curve = st.selectbox("Select Curve", ["ZQ", "SR1", "SR3"])
+    st.subheader("Calendar Spread Monitor")
     
-    spreads = []
-    for i in range(len(df)-1):
-        front = df.iloc[i]
-        back = df.iloc[i+1]
-        val = front[curve] - back[curve]
-        spreads.append({
-            "Spread": f"{front['Suffix']}/{back['Suffix']}",
-            "Price": val,
-            "Type": "Inv" if val < 0 else "Steep"
-        })
+    mat_curve = st.selectbox("Select Curve", ["ZQ", "SR1", "SR3"])
     
-    s_df = pd.DataFrame(spreads)
+    # Generate Matrix Data
+    matrix_data = []
+    contracts = df['Suffix'].tolist()[:12] # First 12 months
+    prices = df[mat_curve].tolist()[:12]
     
-    st.bar_chart(s_df.set_index("Spread")['Price'])
-    st.dataframe(s_df.T, use_container_width=True)
+    # Create correlation-style matrix or list
+    spread_list = []
+    
+    for i in range(len(contracts)-1):
+        c1 = contracts[i]
+        c2 = contracts[i+1]
+        p1 = prices[i]
+        p2 = prices[i+1]
+        val = p1 - p2 # Buy Front, Sell Back
+        spread_list.append({"Pair": f"{c1}/{c2}", "Value": val})
+
+    s_df = pd.DataFrame(spread_list)
+    
+    # 1. Visual Chart
+    st.bar_chart(data=s_df.set_index("Pair"), color="#00F0FF")
+    
+    # 2. Detailed Table (Formatted)
+    st.dataframe(
+        s_df.T, 
+        use_container_width=True,
+        column_config={c: st.column_config.NumberColumn(format="%.3f") for c in s_df.columns}
+    )
+    
+    st.info("💡 Positive Spread = Inverted Curve (Front > Back). Negative Spread = Normal Curve.")
