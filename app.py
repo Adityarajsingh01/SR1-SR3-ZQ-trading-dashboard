@@ -220,7 +220,7 @@ elif view_mode == "Strategy Lab":
                     dist_from_center = i - center_index
                     shift = m * dist_from_center
                 
-               # 4. Plot the results (Using Plotly for professional grids)
+        # 4. Plot the results (Using Plotly for professional grids)
         fig = go.Figure()
         
         fig.add_trace(go.Scatter(
