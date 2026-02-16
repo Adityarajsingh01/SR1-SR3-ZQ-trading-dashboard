@@ -220,11 +220,32 @@ elif view_mode == "Strategy Lab":
                     dist_from_center = i - center_index
                     shift = m * dist_from_center
                 
-                # PnL Calculation:
-                # If Rates go UP (Shift > 0), Price goes DOWN. 
-                # We multiply by -1 to capture this inverse relationship.
-                leg_pnl = -1 * shift * leg_dv01 * (leg['Qty'] * lots)
-                run_pnl += leg_pnl
+               # 4. Plot the results (Using Plotly for professional grids)
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=moves, y=pnl_vals, 
+            fill='tozeroy', name='PnL',
+            line=dict(color='#4CAF50' if pnl_vals[-1] >= 0 else '#F44336', width=3)
+        ))
+        
+        # Add a fixed Zero Line (Visual Reference)
+        fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+
+        fig.update_layout(
+            title=f"PnL Profile: {sim_mode}",
+            xaxis_title="Curve Move (bps)",
+            yaxis_title="Profit / Loss ($)",
+            template="plotly_dark",
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=20)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Professional Success Badge
+        if sim_mode == "Curve Twist (Centered)" and abs(pnl_vals[-1]) == 0:
+             st.success("✅ Strategy is Perfectly Hedged against Curve Rotation.")
             
             pnl_vals.append(round(run_pnl, 2))
             
