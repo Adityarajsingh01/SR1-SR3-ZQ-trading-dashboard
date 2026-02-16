@@ -1,764 +1,346 @@
-"""
-STIR FUTURES TRADING DASHBOARD - COMPLETE CODE
-Copy this entire file as app.py
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
-import requests
-from scipy.interpolate import CubicSpline
-from scipy.optimize import minimize
-from typing import Dict, List, Tuple, Optional
-import warnings
-warnings.filterwarnings('ignore')
+from datetime import date, timedelta, datetime
+import calendar
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 1. CONFIGURATION & CONSTANTS
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="STIR Master Pro", 
+    layout="wide", 
+    page_icon="📈",
+    initial_sidebar_state="expanded"
+)
 
-class Config:
-    SR3_MULTIPLIER = 2500
-    SR1_MULTIPLIER = 4167
-    ZQ_MULTIPLIER = 4167
-    PRICE_REFRESH_SECONDS = 5
-    FRED_REFRESH_SECONDS = 60
-    DELTA_NEUTRAL_THRESHOLD = 50
-    MAX_DV01_WARNING = 15000
-    FRED_API_KEY = "YOUR_FRED_API_KEY"
-    CONTRACT_MONTHS = ['MAR', 'JUN', 'SEP', 'DEC']
-    YEARS = list(range(2025, 2031))
-    
-    COLORS = {
-        'background': '#0E1117',
-        'secondary_bg': '#262730',
-        'text': '#FAFAFA',
-        'positive': '#00C853',
-        'negative': '#FF5252',
-        'neutral': '#2196F3',
-        'accent': '#FFD700',
-        'grid': '#1E1E1E'
-    }
+# Projected FOMC Dates for 2026 (Standard Cycle: Jan, Mar, May, Jun, Jul, Sep, Nov, Dec)
+FOMC_MEETINGS = [
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6), 
+    date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+    date(2026, 11, 4), date(2026, 12, 16)
+]
 
-# ============================================================================
-# DATA FETCHING
-# ============================================================================
+# Futures Ticker Codes
+MONTH_CODES = {
+    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+}
 
-class DataFetcher:
-    def __init__(self):
-        self.fred_api_key = Config.FRED_API_KEY
-        self.cache = {}
-        self.last_fetch_time = {}
-    
-    def fetch_fred_rate(self, series_id: str) -> float:
-        try:
-            url = f"https://api.stlouisfed.org/fred/series/observations"
-            params = {
-                'series_id': series_id,
-                'api_key': self.fred_api_key,
-                'file_type': 'json',
-                'sort_order': 'desc',
-                'limit': 1
-            }
-            response = requests.get(url, params=params, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                return float(data['observations'][0]['value'])
-            return None
-        except:
-            return None
-    
-    def fetch_sofr_rate(self) -> float:
-        rate = self.fetch_fred_rate('SOFR')
-        return rate if rate else 5.30
-    
-    def fetch_fed_funds_rate(self) -> float:
-        rate = self.fetch_fred_rate('DFF')
-        return rate if rate else 5.33
-    
-    def fetch_treasury_yields(self) -> Dict[str, float]:
-        series = {
-            '1M': 'DGS1MO', '3M': 'DGS3MO', '6M': 'DGS6MO',
-            '1Y': 'DGS1', '2Y': 'DGS2', '5Y': 'DGS5', '10Y': 'DGS10'
-        }
-        yields = {}
-        for tenor, series_id in series.items():
-            rate = self.fetch_fred_rate(series_id)
-            yields[tenor] = rate if rate else self._get_fallback_yield(tenor)
-        return yields
-    
-    def _get_fallback_yield(self, tenor: str) -> float:
-        fallbacks = {
-            '1M': 5.35, '3M': 5.30, '6M': 5.20,
-            '1Y': 5.00, '2Y': 4.75, '5Y': 4.40, '10Y': 4.50
-        }
-        return fallbacks.get(tenor, 5.0)
-    
-    def generate_mock_cme_prices(self, contracts: List[str]) -> pd.DataFrame:
-        sofr_rate = self.fetch_sofr_rate()
-        prices = []
-        for i, contract in enumerate(contracts):
-            quarters_out = i * 0.25
-            implied_rate = sofr_rate - (0.05 * quarters_out) + np.random.normal(0, 0.02)
-            price = 100 - implied_rate
-            prices.append({
-                'Contract': contract,
-                'Last': round(price, 3),
-                'Change': round(np.random.normal(0, 0.01), 3),
-                'Bid': round(price - 0.005, 3),
-                'Ask': round(price + 0.005, 3),
-                'Volume': np.random.randint(1000, 50000),
-                'Implied_Rate': round(implied_rate, 4)
-            })
-        return pd.DataFrame(prices)
-    
-    def fetch_fomc_calendar(self) -> List[datetime]:
-        """OFFICIAL FOMC DATES FROM FEDERAL RESERVE"""
-        
-        meetings_2025 = [
-            datetime(2025, 1, 29), datetime(2025, 3, 19), datetime(2025, 5, 7),
-            datetime(2025, 6, 18), datetime(2025, 7, 30), datetime(2025, 9, 17),
-            datetime(2025, 10, 29), datetime(2025, 12, 10)
-        ]
-        
-        meetings_2026 = [
-            datetime(2026, 1, 28), datetime(2026, 3, 18), datetime(2026, 4, 29),
-            datetime(2026, 6, 17), datetime(2026, 7, 29), datetime(2026, 9, 16),
-            datetime(2026, 10, 28), datetime(2026, 12, 9)
-        ]
-        
-        meetings_2027 = [
-            datetime(2027, 1, 27), datetime(2027, 3, 17), datetime(2027, 4, 28),
-            datetime(2027, 6, 9), datetime(2027, 7, 28), datetime(2027, 9, 15),
-            datetime(2027, 10, 27), datetime(2027, 12, 8)
-        ]
-        
-        meetings_2028 = [
-            datetime(2028, 1, 26), datetime(2028, 3, 22), datetime(2028, 5, 3),
-            datetime(2028, 6, 14), datetime(2028, 7, 26), datetime(2028, 9, 20),
-            datetime(2028, 11, 1), datetime(2028, 12, 13)
-        ]
-        
-        meetings_2029 = [
-            datetime(2029, 1, 31), datetime(2029, 3, 21), datetime(2029, 5, 2),
-            datetime(2029, 6, 13), datetime(2029, 7, 25), datetime(2029, 9, 19),
-            datetime(2029, 10, 31), datetime(2029, 12, 12)
-        ]
-        
-        meetings_2030 = [
-            datetime(2030, 1, 30), datetime(2030, 3, 20), datetime(2030, 5, 1),
-            datetime(2030, 6, 19), datetime(2030, 7, 31), datetime(2030, 9, 18),
-            datetime(2030, 10, 30), datetime(2030, 12, 11)
-        ]
-        
-        all_meetings = (meetings_2025 + meetings_2026 + meetings_2027 + 
-                       meetings_2028 + meetings_2029 + meetings_2030)
-        return sorted(all_meetings)
+# DV01 Constants ($ value per 1bp move per contract)
+DV01_ZQ = 41.67
+DV01_SR3 = 25.00
 
-# ============================================================================
-# PRICING ENGINE
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 2. QUANT LOGIC & CALCULATIONS
+# -----------------------------------------------------------------------------
 
-class PricingEngine:
-    def __init__(self):
-        self.data_fetcher = DataFetcher()
-    
-    def build_forward_curve(self, base_rate: float, yields: Dict[str, float]) -> CubicSpline:
-        tenor_map = {
-            '1M': 1/12, '3M': 0.25, '6M': 0.5,
-            '1Y': 1.0, '2Y': 2.0, '5Y': 5.0, '10Y': 10.0
-        }
-        tenors = [tenor_map[k] for k in yields.keys()]
-        rates = [yields[k] for k in yields.keys()]
-        tenors.insert(0, 0)
-        rates.insert(0, base_rate)
-        curve = CubicSpline(tenors, rates)
-        return curve
-    
-    def calculate_dv01(self, contract_type: str, quantity: int, price: float, 
-                      tenor_months: int = 3) -> float:
-        multipliers = {
-            'SR3': Config.SR3_MULTIPLIER,
-            'SR1': Config.SR1_MULTIPLIER,
-            'ZQ': Config.ZQ_MULTIPLIER
-        }
-        multiplier = multipliers.get(contract_type, Config.SR3_MULTIPLIER)
-        dv01 = quantity * multiplier * (tenor_months / 12) / 10000
-        return dv01
+def get_days_in_month(dt):
+    """Returns number of days in the month of the given date."""
+    return calendar.monthrange(dt.year, dt.month)[1]
 
-# ============================================================================
-# SCENARIO GENERATOR
-# ============================================================================
+def get_fomc_impact_ratio(contract_date):
+    """
+    Calculates the weight of the NEW rate vs OLD rate for a ZQ contract
+    based on FOMC meeting date within that month.
+    
+    Logic: ZQ is Arithmetic Average of EFFR.
+    If meeting is on day 20, we have 19 days of Old Rate, and (Total - 19) days of New Rate.
+    """
+    # Find if there is a meeting in this contract's month
+    meeting = next((m for m in FOMC_MEETINGS if m.year == contract_date.year and m.month == contract_date.month), None)
+    
+    if not meeting:
+        # If no meeting, it trades on the rate established by the LAST meeting
+        # For simplicity in this demo, we return 1.0 (Old Rate)
+        return (1.0, 0.0) 
+    
+    days_in_month = get_days_in_month(contract_date)
+    
+    # Days priced at OLD rate (before meeting)
+    # Usually effective date is Meeting Date + 1 or same day depending on announcement timing.
+    # We assume rate change is effective next day for conservative pricing.
+    days_before = meeting.day 
+    days_after = days_in_month - days_before
+    
+    return (days_before / days_in_month, days_after / days_in_month)
 
-class ScenarioGenerator:
-    def __init__(self):
-        self.data_fetcher = DataFetcher()
-        self.pricing_engine = PricingEngine()
-        self.fomc_dates = self.data_fetcher.fetch_fomc_calendar()
+# -----------------------------------------------------------------------------
+# 3. DATA INGESTION (Robust Engine)
+# -----------------------------------------------------------------------------
+
+@st.cache_data
+def fetch_stir_data(base_effr, shock_bps=0):
+    """
+    Generates the STIR curve. 
+    Since free APIs (Yahoo) rarely support granular futures chains (ZQM6 vs ZQU6) reliable enough for 
+    demoing math, we generate a 'Pro-Grade Synthetic Curve' that reacts to your inputs.
+    """
+    today = date.today()
+    contracts = []
     
-    def generate_scenarios(self, current_rate: float, num_scenarios: int = 20) -> List[Dict]:
-        scenarios = []
-        scenarios.append(self._create_baseline_scenario(current_rate))
-        scenarios.extend(self._create_dot_plot_scenarios(current_rate))
-        scenarios.extend(self._create_monte_carlo_scenarios(current_rate, n=10))
-        scenarios.extend(self._create_shock_scenarios(current_rate))
-        
-        total_prob = sum(s['probability'] for s in scenarios)
-        for s in scenarios:
-            s['probability'] = s['probability'] / total_prob
-        
-        return scenarios[:num_scenarios]
+    # Curve Shape parameters (Simulating an inverted curve common in high rate environments)
+    # Front end is higher (tight policy), back end is lower (cuts priced in)
+    curve_slope = -0.04  # -4 bps per month
     
-    def _create_baseline_scenario(self, current_rate: float) -> Dict:
-        path = [current_rate]
-        rate = current_rate
-        meetings = len([d for d in self.fomc_dates if d > datetime.now()])
-        target = 3.5
+    for i in range(18): # 18 Month view
+        future_date = today + timedelta(days=30*i)
         
-        for i in range(min(meetings, 30)):
-            if rate > target:
-                cut = min(0.25, (rate - target) / 2)
-                rate -= cut
-            path.append(rate)
+        # Skip if date is in the past
+        if future_date < today:
+            continue
+            
+        month_code = MONTH_CODES[future_date.month]
+        year_code = str(future_date.year)[-1] # '6' for 2026
+        ticker_suffix = f"{month_code}{year_code}"
         
-        return {
-            'name': 'Market Implied',
-            'path': path,
-            'terminal_rate': path[-1],
-            'probability': 0.40,
-            'color': Config.COLORS['neutral']
-        }
-    
-    def _create_dot_plot_scenarios(self, current_rate: float) -> List[Dict]:
-        scenarios = []
+        # 1. Calculate Base Rate for this month (Inverted Curve Logic)
+        # We add some random noise to simulate market inefficiencies
+        market_rate = base_effr + (i * curve_slope) + (np.random.normal(0, 0.015))
         
-        hawkish_path = [current_rate]
-        rate = current_rate
-        for _ in range(30):
-            if rate > 4.0:
-                rate -= 0.125
-            hawkish_path.append(rate)
+        # Apply the user's "Shock" scenario if any
+        market_rate += (shock_bps / 100)
+
+        # 2. ZQ Pricing (Arithmetic)
+        # ZQ prices exactly to 100 - Rate
+        zq_price = 100 - market_rate
         
-        scenarios.append({
-            'name': 'Hawkish (Dot Plot)',
-            'path': hawkish_path,
-            'terminal_rate': hawkish_path[-1],
-            'probability': 0.15,
-            'color': '#FF6B6B'
+        # 3. SR3 Pricing (Geometric + Credit Spread)
+        # SOFR usually trades slightly below EFFR (e.g. -5 to -10 bps)
+        # SR3 has convexity (it's better to be long SR3 than ZQ in volatile cuts)
+        sr3_rate = market_rate - 0.08 # Spread to EFFR
+        sr3_price = 100 - sr3_rate
+
+        contracts.append({
+            "Expiry": future_date.strftime("%b %Y"),
+            "MonthCode": ticker_suffix,
+            "ZQ_Ticker": f"ZQ{ticker_suffix}",
+            "ZQ_Price": round(zq_price, 3),
+            "ZQ_Rate": round(100 - zq_price, 3),
+            "SR3_Ticker": f"SR3{ticker_suffix}",
+            "SR3_Price": round(sr3_price, 3),
+            "SR3_Rate": round(100 - sr3_price, 3),
+            "Date_Obj": future_date
         })
         
-        median_path = [current_rate]
-        rate = current_rate
-        for _ in range(30):
-            if rate > 3.5:
-                rate -= 0.20
-            median_path.append(rate)
-        
-        scenarios.append({
-            'name': 'Median (Dot Plot)',
-            'path': median_path,
-            'terminal_rate': median_path[-1],
-            'probability': 0.25,
-            'color': '#4ECDC4'
-        })
-        
-        dovish_path = [current_rate]
-        rate = current_rate
-        for _ in range(30):
-            if rate > 3.0:
-                rate -= 0.30
-            dovish_path.append(rate)
-        
-        scenarios.append({
-            'name': 'Dovish (Dot Plot)',
-            'path': dovish_path,
-            'terminal_rate': dovish_path[-1],
-            'probability': 0.10,
-            'color': '#95E1D3'
-        })
-        
-        return scenarios
-    
-    def _create_monte_carlo_scenarios(self, current_rate: float, n: int = 10) -> List[Dict]:
-        scenarios = []
-        for i in range(n):
-            path = [current_rate]
-            rate = current_rate
-            target = np.random.uniform(2.5, 4.5)
-            volatility = 0.15
-            
-            for _ in range(30):
-                drift = (target - rate) * 0.1
-                shock = np.random.normal(0, volatility)
-                change = drift + shock
-                rate = max(0.0, min(6.0, rate + change))
-                path.append(rate)
-            
-            scenarios.append({
-                'name': f'MC Scenario {i+1}',
-                'path': path,
-                'terminal_rate': path[-1],
-                'probability': 0.30 / n,
-                'color': f'rgba(150, 150, 150, 0.3)'
-            })
-        
-        return scenarios
-    
-    def _create_shock_scenarios(self, current_rate: float) -> List[Dict]:
-        scenarios = []
-        
-        recession_path = [current_rate]
-        rate = current_rate
-        for i in range(30):
-            if i < 8:
-                rate = max(2.0, rate - 0.50)
-            recession_path.append(rate)
-        
-        scenarios.append({
-            'name': 'Recession',
-            'path': recession_path,
-            'terminal_rate': recession_path[-1],
-            'probability': 0.05,
-            'color': '#D32F2F'
-        })
-        
-        hike_path = [current_rate]
-        rate = current_rate
-        for i in range(30):
-            if i < 6:
-                rate = min(6.0, rate + 0.25)
-            hike_path.append(rate)
-        
-        scenarios.append({
-            'name': 'Reacceleration',
-            'path': hike_path,
-            'terminal_rate': hike_path[-1],
-            'probability': 0.05,
-            'color': '#FFA726'
-        })
-        
-        return scenarios
-    
-    def price_contracts_in_scenario(self, scenario: Dict, contracts: List[str]) -> Dict[str, float]:
-        prices = {}
-        for contract in contracts:
-            parts = contract.split('_')
-            if len(parts) != 2:
-                continue
-            
-            month_code = parts[1][:3]
-            year = int('20' + parts[1][3:])
-            month_map = {'MAR': 3, 'JUN': 6, 'SEP': 9, 'DEC': 12}
-            month = month_map.get(month_code, 3)
-            maturity_date = datetime(year, month, 15)
-            
-            days_from_now = (maturity_date - datetime.now()).days
-            meetings_out = max(0, min(len(scenario['path']) - 1, days_from_now // 45))
-            implied_rate = scenario['path'][meetings_out]
-            price = 100 - implied_rate
-            prices[contract] = round(price, 3)
-        
-        return prices
+    return pd.DataFrame(contracts)
 
-# ============================================================================
-# STRATEGY BUILDER
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 4. UI & STATE
+# -----------------------------------------------------------------------------
 
-class StrategyBuilder:
-    def __init__(self):
-        self.pricing_engine = PricingEngine()
-    
-    def build_outright(self, contract: str, quantity: int, price: float) -> Dict:
-        contract_type = contract.split('_')[0]
-        dv01 = self.pricing_engine.calculate_dv01(contract_type, quantity, price)
-        return {
-            'type': 'Outright',
-            'legs': [{'contract': contract, 'quantity': quantity, 'price': price}],
-            'dv01': dv01,
-            'description': f'{quantity:+d} {contract} @ {price}'
-        }
-    
-    def build_calendar_spread(self, front_contract: str, back_contract: str,
-                              front_qty: int, front_price: float, back_price: float) -> Dict:
-        contract_type = front_contract.split('_')[0]
-        back_qty = -front_qty
-        
-        front_dv01 = self.pricing_engine.calculate_dv01(contract_type, front_qty, front_price)
-        back_dv01 = self.pricing_engine.calculate_dv01(contract_type, back_qty, back_price)
-        total_dv01 = front_dv01 + back_dv01
-        
-        return {
-            'type': 'Calendar Spread',
-            'legs': [
-                {'contract': front_contract, 'quantity': front_qty, 'price': front_price},
-                {'contract': back_contract, 'quantity': back_qty, 'price': back_price}
-            ],
-            'dv01': total_dv01,
-            'spread': front_price - back_price,
-            'description': f'{front_contract}/{back_contract} spread'
-        }
-    
-    def build_butterfly(self, front: str, middle: str, back: str,
-                       front_price: float, middle_price: float, back_price: float,
-                       ratio: Tuple[int, int, int] = (1, -2, 1)) -> Dict:
-        contract_type = front.split('_')[0]
-        
-        legs = [
-            {'contract': front, 'quantity': ratio[0], 'price': front_price},
-            {'contract': middle, 'quantity': ratio[1], 'price': middle_price},
-            {'contract': back, 'quantity': ratio[2], 'price': back_price}
-        ]
-        
-        total_dv01 = sum([
-            self.pricing_engine.calculate_dv01(contract_type, leg['quantity'], leg['price'])
-            for leg in legs
-        ])
-        
-        fly_value = (front_price + back_price) / 2 - middle_price
-        
-        return {
-            'type': 'Butterfly',
-            'legs': legs,
-            'dv01': total_dv01,
-            'fly_value': fly_value,
-            'is_neutral': abs(total_dv01) < Config.DELTA_NEUTRAL_THRESHOLD,
-            'description': f'{front}/{middle}/{back} fly'
-        }
-    
-    def calculate_strategy_pnl(self, strategy: Dict, scenario_prices: Dict[str, float]) -> float:
-        pnl = 0.0
-        for leg in strategy['legs']:
-            contract = leg['contract']
-            quantity = leg['quantity']
-            entry_price = leg['price']
-            scenario_price = scenario_prices.get(contract, entry_price)
-            
-            contract_type = contract.split('_')[0]
-            multiplier = {
-                'SR3': Config.SR3_MULTIPLIER,
-                'SR1': Config.SR1_MULTIPLIER,
-                'ZQ': Config.ZQ_MULTIPLIER
-            }.get(contract_type, Config.SR3_MULTIPLIER)
-            
-            leg_pnl = quantity * multiplier * (scenario_price - entry_price) * 100
-            pnl += leg_pnl
-        
-        return pnl
+# Initialize Session State
+if 'notional' not in st.session_state:
+    st.session_state['notional'] = 100
 
-# ============================================================================
-# RISK CALCULATOR
-# ============================================================================
+# --- Sidebar ---
+st.sidebar.title("STIR Master Pro 📊")
+view_mode = st.sidebar.radio("Module", ["Curve Analyzer", "Strategy Lab", "Arb Scanner"])
 
-class RiskCalculator:
-    def __init__(self):
-        self.pricing_engine = PricingEngine()
+st.sidebar.markdown("---")
+st.sidebar.header("Global Parameters")
+base_rate_input = st.sidebar.number_input("Current EFFR (%)", value=5.33, step=0.01)
+curve_shock = st.sidebar.slider("Market Shock Scenario (bps)", -100, 100, 0)
+
+# Load Data
+df = fetch_stir_data(base_rate_input, curve_shock)
+
+# --- Main Dashboard ---
+
+st.title(f"STIR Trading Desk")
+st.caption(f"Pricing Date: {date.today().strftime('%Y-%m-%d')} | Data Mode: Synthetic Real-Time")
+
+# Ticker Tape (Top)
+tape_cols = st.columns(6)
+for i in range(min(6, len(df))):
+    row = df.iloc[i]
+    with tape_cols[i]:
+        st.metric(
+            label=row['ZQ_Ticker'], 
+            value=f"{row['ZQ_Price']:.3f}", 
+            delta=f"{(row['ZQ_Rate'] - base_rate_input):.2f}%"
+        )
+
+st.markdown("---")
+
+# -----------------------------------------------------------------------------
+# 5. MODULE: CURVE ANALYZER
+# -----------------------------------------------------------------------------
+if view_mode == "Curve Analyzer":
+    col_chart, col_data = st.columns([2, 1])
     
-    def calculate_portfolio_dv01(self, strategies: List[Dict]) -> float:
-        return sum(s.get('dv01', 0) for s in strategies)
-
-# ============================================================================
-# VISUALIZER
-# ============================================================================
-
-class Visualizer:
-    @staticmethod
-    def create_forward_curve_chart(scenarios: List[Dict], current_rate: float) -> go.Figure:
+    with col_chart:
+        st.subheader("Forward Term Structure")
+        
         fig = go.Figure()
         
-        for scenario in scenarios[:8]:
-            meetings = list(range(len(scenario['path'])))
-            fig.add_trace(go.Scatter(
-                x=meetings,
-                y=scenario['path'],
-                mode='lines',
-                name=scenario['name'],
-                line=dict(color=scenario.get('color', Config.COLORS['neutral']), width=2),
-                opacity=0.7
-            ))
+        # ZQ Curve
+        fig.add_trace(go.Scatter(
+            x=df['Expiry'], y=df['ZQ_Rate'], 
+            mode='lines+markers', name='ZQ (Fed Funds)',
+            line=dict(color='#00F0FF', width=3)
+        ))
         
-        fig.add_hline(
-            y=current_rate,
-            line_dash="dash",
-            line_color=Config.COLORS['accent'],
-            annotation_text="Current Rate"
-        )
+        # SR3 Curve
+        fig.add_trace(go.Scatter(
+            x=df['Expiry'], y=df['SR3_Rate'], 
+            mode='lines+markers', name='SR3 (SOFR)',
+            line=dict(color='#FFA500', width=3, dash='dash')
+        ))
         
         fig.update_layout(
-            title="FOMC Rate Path Scenarios",
-            xaxis_title="Meetings Ahead",
-            yaxis_title="Fed Funds Rate (%)",
+            title="Implied Rates (%)",
+            xaxis_title="Contract Month",
+            yaxis_title="Rate",
             template="plotly_dark",
-            paper_bgcolor=Config.COLORS['background'],
-            plot_bgcolor=Config.COLORS['background'],
-            font=dict(color=Config.COLORS['text']),
-            hovermode='x unified',
+            height=500,
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+    with col_data:
+        st.subheader("Curve Data")
+        st.dataframe(
+            df[['Expiry', 'ZQ_Price', 'SR3_Price', 'ZQ_Rate']].style.format("{:.3f}"),
             height=500
         )
-        
-        return fig
 
-# ============================================================================
-# STREAMLIT UI
-# ============================================================================
-
-def init_session_state():
-    if 'strategies' not in st.session_state:
-        st.session_state.strategies = []
-    if 'account_size' not in st.session_state:
-        st.session_state.account_size = 100000
-    if 'max_risk_pct' not in st.session_state:
-        st.session_state.max_risk_pct = 2.0
-    if 'max_dv01' not in st.session_state:
-        st.session_state.max_dv01 = 5000
-    if 'notifications' not in st.session_state:
-        st.session_state.notifications = []
+# -----------------------------------------------------------------------------
+# 6. MODULE: STRATEGY LAB (FLYS, SPREADS)
+# -----------------------------------------------------------------------------
+elif view_mode == "Strategy Lab":
+    st.subheader("Strategy Constructor")
     
-    if 'contracts' not in st.session_state:
-        contracts = []
-        current_year = 2025
-        current_quarter = 0
-        for i in range(8):
-            month = Config.CONTRACT_MONTHS[current_quarter]
-            contracts.append(f"SR3_{month}{str(current_year)[2:]}")
-            current_quarter = (current_quarter + 1) % 4
-            if current_quarter == 0:
-                current_year += 1
+    c1, c2 = st.columns([1, 2])
+    
+    with c1:
+        st.markdown("### Build Structure")
+        strat_type = st.selectbox("Type", ["Calendar Spread", "Butterfly (Fly)", "Condor"])
+        instrument = st.selectbox("Instrument", ["ZQ", "SR3"])
         
-        for year in Config.YEARS:
-            for month in Config.CONTRACT_MONTHS:
-                contracts.append(f"SR1_{month}{str(year)[2:]}")
-                contracts.append(f"ZQ_{month}{str(year)[2:]}")
+        # Dynamic Contract Selection
+        tickers = df[f'{instrument}_Ticker'].tolist()
         
-        st.session_state.contracts = contracts
-
-def add_notification(message: str, type: str = "info"):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.notifications.insert(0, {
-        'time': timestamp,
-        'message': message,
-        'type': type
-    })
-    st.session_state.notifications = st.session_state.notifications[:10]
-
-def render_header():
-    st.markdown(f"""
-        <div style='background-color: {Config.COLORS['secondary_bg']}; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>
-            <h1 style='color: {Config.COLORS['accent']}; margin: 0;'>⚡ STIR Futures Trading Workstation</h1>
-            <p style='color: {Config.COLORS['text']}; margin: 5px 0 0 0;'>
-                Professional SR1/SR3/ZQ Trading Platform with FOMC Scenario Modeling
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-
-def render_sidebar():
-    with st.sidebar:
-        st.markdown(f"<h2 style='color: {Config.COLORS['accent']}'>⚙️ Settings</h2>", unsafe_allow_html=True)
+        legs = []
         
-        page = st.radio(
-            "📍 Navigate to:",
-            ["Live Prices", "Strategy Builder", "FOMC Scenarios"],
-            key="navigation"
-        )
-        
-        st.divider()
-        st.markdown(f"<h3 style='color: {Config.COLORS['text']}'>💰 Account</h3>", unsafe_allow_html=True)
-        
-        st.session_state.account_size = st.number_input(
-            "Account Size ($)",
-            min_value=10000,
-            value=st.session_state.account_size,
-            step=10000
-        )
-        
-        st.session_state.max_risk_pct = st.slider(
-            "Max Risk per Trade (%)",
-            min_value=0.5,
-            max_value=5.0,
-            value=st.session_state.max_risk_pct,
-            step=0.5
-        )
-        
-        return page
-
-def render_live_prices_page():
-    st.markdown(f"<h2 style='color: {Config.COLORS['accent']}'>📈 Live Prices</h2>", unsafe_allow_html=True)
-    
-    data_fetcher = DataFetcher()
-    contracts = st.session_state.contracts
-    prices_df = data_fetcher.generate_mock_cme_prices(contracts)
-    
-    tab1, tab2, tab3 = st.tabs(["SR3 Contracts", "SR1 Contracts", "ZQ Contracts"])
-    
-    with tab1:
-        sr3_prices = prices_df[prices_df['Contract'].str.startswith('SR3')]
-        st.dataframe(sr3_prices, use_container_width=True, height=400)
-    
-    with tab2:
-        sr1_prices = prices_df[prices_df['Contract'].str.startswith('SR1')]
-        st.dataframe(sr1_prices, use_container_width=True, height=400)
-    
-    with tab3:
-        zq_prices = prices_df[prices_df['Contract'].str.startswith('ZQ')]
-        st.dataframe(zq_prices, use_container_width=True, height=400)
-    
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        sofr = data_fetcher.fetch_sofr_rate()
-        st.metric("SOFR Rate", f"{sofr:.2f}%")
-    
-    with col2:
-        ff = data_fetcher.fetch_fed_funds_rate()
-        st.metric("Fed Funds", f"{ff:.2f}%")
-    
-    with col3:
-        st.metric("Last Update", datetime.now().strftime("%H:%M:%S"))
-
-def render_strategy_builder_page():
-    st.markdown(f"<h2 style='color: {Config.COLORS['accent']}'>🔨 Strategy Builder</h2>", unsafe_allow_html=True)
-    
-    builder = StrategyBuilder()
-    data_fetcher = DataFetcher()
-    
-    contracts = st.session_state.contracts
-    prices_df = data_fetcher.generate_mock_cme_prices(contracts)
-    price_dict = dict(zip(prices_df['Contract'], prices_df['Last']))
-    
-    strategy_type = st.selectbox(
-        "Select Strategy Type",
-        ["Outright", "Calendar Spread", "Butterfly"]
-    )
-    
-    st.markdown("---")
-    
-    if strategy_type == "Outright":
-        col1, col2 = st.columns(2)
-        with col1:
-            contract = st.selectbox("Contract", contracts)
-            quantity = st.number_input("Quantity", value=1, step=1)
-        with col2:
-            price = st.number_input("Price", value=price_dict.get(contract, 96.0), step=0.001, format="%.3f")
-        
-        if st.button("Add Strategy", type="primary"):
-            strategy = builder.build_outright(contract, quantity, price)
-            st.session_state.strategies.append(strategy)
-            add_notification(f"Added outright: {strategy['description']}", "success")
-            st.rerun()
-    
-    elif strategy_type == "Calendar Spread":
-        col1, col2 = st.columns(2)
-        with col1:
-            front = st.selectbox("Front Contract", contracts, key="front")
-            quantity = st.number_input("Quantity", value=1, step=1)
-        with col2:
-            back = st.selectbox("Back Contract", contracts, key="back")
-        
-        front_price = price_dict.get(front, 96.0)
-        back_price = price_dict.get(back, 95.8)
-        
-        st.write(f"**Spread**: {front_price - back_price:.3f}")
-        
-        if st.button("Add Strategy", type="primary"):
-            strategy = builder.build_calendar_spread(front, back, quantity, front_price, back_price)
-            st.session_state.strategies.append(strategy)
-            add_notification(f"Added calendar spread", "success")
-            st.rerun()
-    
-    elif strategy_type == "Butterfly":
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            front = st.selectbox("Front", contracts, key="fly_front")
-        with col2:
-            middle = st.selectbox("Middle", contracts, key="fly_middle")
-        with col3:
-            back = st.selectbox("Back", contracts, key="fly_back")
-        
-        front_price = price_dict.get(front, 96.2)
-        middle_price = price_dict.get(middle, 96.0)
-        back_price = price_dict.get(back, 95.8)
-        
-        if st.button("Add Strategy", type="primary"):
-            strategy = builder.build_butterfly(front, middle, back, front_price, middle_price, back_price)
-            st.session_state.strategies.append(strategy)
-            add_notification(f"Added butterfly", "success")
-            st.rerun()
-    
-    st.markdown("---")
-    st.markdown("### 📋 Active Strategies")
-    
-    if st.session_state.strategies:
-        for i, strategy in enumerate(st.session_state.strategies):
-            with st.expander(f"{strategy['type']}: {strategy['description']}"):
-                st.write("**Legs:**")
-                for leg in strategy['legs']:
-                    st.write(f"- {leg['quantity']:+d} {leg['contract']} @ {leg['price']:.3f}")
-                st.write(f"**DV01:** ${strategy['dv01']:.2f}")
+        if strat_type == "Calendar Spread":
+            leg1 = st.selectbox("Front Leg (Buy)", tickers, index=0)
+            leg2 = st.selectbox("Back Leg (Sell)", tickers, index=2)
+            
+            p1 = df.loc[df[f'{instrument}_Ticker'] == leg1, f'{instrument}_Price'].values[0]
+            p2 = df.loc[df[f'{instrument}_Ticker'] == leg2, f'{instrument}_Price'].values[0]
+            
+            legs = [(1, p1, leg1), (-1, p2, leg2)]
+            
+        elif strat_type == "Butterfly (Fly)":
+            # Fly = Long Wing, Short 2x Belly, Long Wing
+            belly = st.selectbox("Belly (Center)", tickers, index=2)
+            width = st.slider("Wing Width (Months)", 1, 3, 1)
+            
+            try:
+                idx = tickers.index(belly)
+                wing1 = tickers[idx - width]
+                wing2 = tickers[idx + width]
                 
-                if st.button("Remove", key=f"remove_{i}"):
-                    st.session_state.strategies.pop(i)
-                    st.rerun()
-    else:
-        st.info("No strategies yet. Build one above!")
+                p_belly = df.loc[df[f'{instrument}_Ticker'] == belly, f'{instrument}_Price'].values[0]
+                p_w1 = df.loc[df[f'{instrument}_Ticker'] == wing1, f'{instrument}_Price'].values[0]
+                p_w2 = df.loc[df[f'{instrument}_Ticker'] == wing2, f'{instrument}_Price'].values[0]
+                
+                legs = [(1, p_w1, wing1), (-2, p_belly, belly), (1, p_w2, wing2)]
+                
+            except IndexError:
+                st.error("Structure out of bounds. Move Belly to center of curve.")
 
-def render_fomc_scenarios_page():
-    st.markdown(f"<h2 style='color: {Config.COLORS['accent']}'>🎯 FOMC Scenarios</h2>", unsafe_allow_html=True)
-    
-    scenario_gen = ScenarioGenerator()
-    data_fetcher = DataFetcher()
-    visualizer = Visualizer()
-    
-    current_rate = data_fetcher.fetch_sofr_rate()
-    
-    with st.spinner("Generating 20 FOMC scenarios..."):
-        scenarios = scenario_gen.generate_scenarios(current_rate, num_scenarios=20)
-    
-    st.markdown("### 📊 Rate Path Scenarios")
-    fig = visualizer.create_forward_curve_chart(scenarios, current_rate)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("### 📋 Scenario Details")
-    scenario_data = []
-    for s in scenarios:
-        scenario_data.append({
-            'Scenario': s['name'],
-            'Terminal Rate': f"{s['terminal_rate']:.2f}%",
-            'Probability': f"{s['probability']*100:.1f}%"
-        })
-    
-    scenario_df = pd.DataFrame(scenario_data)
-    st.dataframe(scenario_df, use_container_width=True)
+        # Calculate Price
+        net_price = sum([q * p for q, p, n in legs])
+        st.metric(f"{strat_type} Price", f"{net_price:.3f}")
+        
+        # Position Sizing
+        st.markdown("### Sizing")
+        qty = st.number_input("Quantity (Lots)", value=100)
+        dv01_val = DV01_ZQ if instrument == "ZQ" else DV01_SR3
+        
+        # Net DV01
+        # Sum of abs(qty * leg_qty) is margin risk, but net DV01 is directional risk
+        net_dv01 = sum([q * dv01_val for q, p, n in legs]) * qty
+        st.write(f"**Net DV01:** ${net_dv01:.2f} / bp")
 
-def main():
-    st.set_page_config(
-        page_title="STIR Trading Workstation",
-        page_icon="⚡",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    st.markdown(f"""
-        <style>
-            .stApp {{
-                background-color: {Config.COLORS['background']};
-                color: {Config.COLORS['text']};
-            }}
-        </style>
-    """, unsafe_allow_html=True)
-    
-    init_session_state()
-    render_header()
-    page = render_sidebar()
-    
-    if page == "Live Prices":
-        render_live_prices_page()
-    elif page == "Strategy Builder":
-        render_strategy_builder_page()
-    elif page == "FOMC Scenarios":
-        render_fomc_scenarios_page()
+    with c2:
+        st.markdown("### Payoff Analysis")
+        
+        # Visualize "Belly" Cheapness
+        if strat_type == "Butterfly (Fly)":
+            # Extract just the relevant segment of the curve to visualize the "kink"
+            relevant_indices = [tickers.index(l[2]) for l in legs]
+            relevant_indices.sort()
+            start_i, end_i = relevant_indices[0], relevant_indices[-1]
+            
+            segment = df.iloc[start_i:end_i+1]
+            
+            fig_fly = go.Figure()
+            fig_fly.add_trace(go.Scatter(
+                x=segment['Expiry'], y=segment[f'{instrument}_Price'],
+                mode='lines+markers', name='Market Curve',
+                line=dict(color='yellow')
+            ))
+            
+            # Draw the Linear Interpolation (The "Fair" Value if no convexity)
+            fig_fly.add_trace(go.Scatter(
+                x=[segment.iloc[0]['Expiry'], segment.iloc[-1]['Expiry']],
+                y=[segment.iloc[0][f'{instrument}_Price'], segment.iloc[-1][f'{instrument}_Price']],
+                mode='lines', name='Linear Fair Value',
+                line=dict(color='white', dash='dot')
+            ))
+            
+            fig_fly.update_layout(title=f"Visualizing the Belly: {belly}", template="plotly_dark")
+            st.plotly_chart(fig_fly, use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+        st.write("#### Leg Execution")
+        exec_df = pd.DataFrame(legs, columns=["Ratio", "Ref Price", "Ticker"])
+        exec_df['Total Lots'] = exec_df['Ratio'] * qty
+        st.table(exec_df)
+
+# -----------------------------------------------------------------------------
+# 7. MODULE: ARB SCANNER
+# -----------------------------------------------------------------------------
+elif view_mode == "Arb Scanner":
+    st.subheader("ZQ vs FOMC Meeting Dates")
+    st.info("This tool strips the ZQ price to find the implied rate between meetings.")
+    
+    col_arb1, col_arb2 = st.columns(2)
+    
+    with col_arb1:
+        arb_ticker = st.selectbox("Select ZQ Contract", df['ZQ_Ticker'].unique())
+        row = df[df['ZQ_Ticker'] == arb_ticker].iloc[0]
+        
+        contract_date = row['Date_Obj']
+        # Calculate weights
+        w_old, w_new = get_fomc_impact_ratio(contract_date)
+        
+        st.metric("Current Market Price", f"{row['ZQ_Price']:.3f}")
+        st.write(f"**FOMC Weighting Logic:**")
+        st.write(f"- Days at Old Rate: {w_old*100:.1f}%")
+        st.write(f"- Days at New Rate: {w_new*100:.1f}%")
+        
+        if w_new == 0:
+            st.warning("No FOMC meeting scheduled in this contract month.")
+    
+    with col_arb2:
+        st.write("### Theoretical Pricing")
+        
+        user_hike = st.select_slider("FOMC Move (bps)", options=[-50, -25, 0, 25, 50], value=-25)
+        
+        # Calculate what the price SHOULD be if that hike happens
+        # Logic: (OldRate * w_old) + ((OldRate + Hike) * w_new)
+        
+        # We assume the "Old Rate" is the current EFFR input from sidebar
+        old_rate = base_rate_input
+        new_rate = old_rate + (user_hike/100)
+        
+        fair_rate = (old_rate * w_old) + (new_rate * w_new)
+        fair_price = 100 - fair_rate
+        
+        st.metric(f"Fair Value (if {user_hike}bps)", f"{fair_price:.3f}", delta=f"{fair_price - row['ZQ_Price']:.3f}")
+        
+        st.caption("If Delta is POSITIVE (Green), Market is CHEAP (Buy). If NEGATIVE (Red), Market is RICH (Sell).")
