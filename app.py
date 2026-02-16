@@ -6,16 +6,35 @@ from datetime import date, timedelta, datetime
 import calendar
 
 # -----------------------------------------------------------------------------
-# 1. CONFIGURATION & CONSTANTS
+# 1. CONFIGURATION & STYLING
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="STIR Master Pro", 
     layout="wide", 
-    page_icon="📈",
+    page_icon="📉",
     initial_sidebar_state="expanded"
 )
 
-# Projected FOMC Dates for 2026 (Standard Cycle: Jan, Mar, May, Jun, Jul, Sep, Nov, Dec)
+# Custom CSS for a tighter, trader-like feel
+st.markdown("""
+<style>
+    .stMetric {
+        background-color: #1E1E1E;
+        padding: 10px;
+        border-radius: 5px;
+        border: 1px solid #333;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.2rem; 
+        color: #00F0FF; 
+    }
+    div[data-testid="stMetricDelta"] {
+        font-size: 0.8rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Projected FOMC Dates for 2026 (Standard Cycle)
 FOMC_MEETINGS = [
     date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6), 
     date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
@@ -28,89 +47,70 @@ MONTH_CODES = {
     7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
 }
 
-# DV01 Constants ($ value per 1bp move per contract)
+# DV01 Constants
 DV01_ZQ = 41.67
 DV01_SR3 = 25.00
 
 # -----------------------------------------------------------------------------
-# 2. QUANT LOGIC & CALCULATIONS
+# 2. CORE LOGIC
 # -----------------------------------------------------------------------------
 
 def get_days_in_month(dt):
-    """Returns number of days in the month of the given date."""
     return calendar.monthrange(dt.year, dt.month)[1]
 
 def get_fomc_impact_ratio(contract_date):
     """
-    Calculates the weight of the NEW rate vs OLD rate for a ZQ contract
-    based on FOMC meeting date within that month.
-    
-    Logic: ZQ is Arithmetic Average of EFFR.
-    If meeting is on day 20, we have 19 days of Old Rate, and (Total - 19) days of New Rate.
+    Returns weights (w_old, w_new) for ZQ arithmetic averaging.
     """
-    # Find if there is a meeting in this contract's month
     meeting = next((m for m in FOMC_MEETINGS if m.year == contract_date.year and m.month == contract_date.month), None)
     
     if not meeting:
-        # If no meeting, it trades on the rate established by the LAST meeting
-        # For simplicity in this demo, we return 1.0 (Old Rate)
         return (1.0, 0.0) 
     
     days_in_month = get_days_in_month(contract_date)
-    
-    # Days priced at OLD rate (before meeting)
-    # Usually effective date is Meeting Date + 1 or same day depending on announcement timing.
-    # We assume rate change is effective next day for conservative pricing.
     days_before = meeting.day 
     days_after = days_in_month - days_before
     
     return (days_before / days_in_month, days_after / days_in_month)
 
-# -----------------------------------------------------------------------------
-# 3. DATA INGESTION (Robust Engine)
-# -----------------------------------------------------------------------------
-
 @st.cache_data
 def fetch_stir_data(base_effr, shock_bps=0):
     """
-    Generates the STIR curve. 
-    Since free APIs (Yahoo) rarely support granular futures chains (ZQM6 vs ZQU6) reliable enough for 
-    demoing math, we generate a 'Pro-Grade Synthetic Curve' that reacts to your inputs.
+    Generates a Pro-Grade Synthetic Curve.
     """
     today = date.today()
     contracts = []
     
-    # Curve Shape parameters (Simulating an inverted curve common in high rate environments)
-    # Front end is higher (tight policy), back end is lower (cuts priced in)
-    curve_slope = -0.04  # -4 bps per month
+    # Curve Shape: Inverted initially (-4bps/month slope)
+    curve_slope = -0.04 
     
-    for i in range(18): # 18 Month view
+    for i in range(18): 
         future_date = today + timedelta(days=30*i)
-        
-        # Skip if date is in the past
-        if future_date < today:
-            continue
+        if future_date < today: continue
             
         month_code = MONTH_CODES[future_date.month]
-        year_code = str(future_date.year)[-1] # '6' for 2026
+        year_code = str(future_date.year)[-1] 
         ticker_suffix = f"{month_code}{year_code}"
         
-        # 1. Calculate Base Rate for this month (Inverted Curve Logic)
-        # We add some random noise to simulate market inefficiencies
-        market_rate = base_effr + (i * curve_slope) + (np.random.normal(0, 0.015))
-        
-        # Apply the user's "Shock" scenario if any
-        market_rate += (shock_bps / 100)
+        # 1. Base Market Rate (with noise + shock)
+        raw_rate = base_effr + (i * curve_slope) + (np.random.normal(0, 0.01))
+        market_rate = raw_rate + (shock_bps / 100)
 
         # 2. ZQ Pricing (Arithmetic)
-        # ZQ prices exactly to 100 - Rate
         zq_price = 100 - market_rate
         
-        # 3. SR3 Pricing (Geometric + Credit Spread)
-        # SOFR usually trades slightly below EFFR (e.g. -5 to -10 bps)
-        # SR3 has convexity (it's better to be long SR3 than ZQ in volatile cuts)
-        sr3_rate = market_rate - 0.08 # Spread to EFFR
+        # 3. SR3 Pricing (Geometric + Spread)
+        sr3_rate = market_rate - 0.08 
         sr3_price = 100 - sr3_rate
+        
+        # 4. Fair Value Calculation (Arb Logic)
+        w_old, w_new = get_fomc_impact_ratio(future_date)
+        # Assume market implies a cut path
+        implied_cut_path = base_effr - (0.02 * i) 
+        fair_rate = (w_old * implied_cut_path) + (w_new * (implied_cut_path - 0.25)) 
+        fair_price_zq = 100 - fair_rate
+        
+        arb_signal = fair_price_zq - zq_price # Positive = Market is Cheap (Buy)
 
         contracts.append({
             "Expiry": future_date.strftime("%b %Y"),
@@ -118,6 +118,8 @@ def fetch_stir_data(base_effr, shock_bps=0):
             "ZQ_Ticker": f"ZQ{ticker_suffix}",
             "ZQ_Price": round(zq_price, 3),
             "ZQ_Rate": round(100 - zq_price, 3),
+            "Fair_Val_ZQ": round(fair_price_zq, 3),
+            "Arb_Basis": round(arb_signal * 100, 1), # in bps
             "SR3_Ticker": f"SR3{ticker_suffix}",
             "SR3_Price": round(sr3_price, 3),
             "SR3_Rate": round(100 - sr3_price, 3),
@@ -127,220 +129,183 @@ def fetch_stir_data(base_effr, shock_bps=0):
     return pd.DataFrame(contracts)
 
 # -----------------------------------------------------------------------------
-# 4. UI & STATE
+# 3. UI LAYOUT
 # -----------------------------------------------------------------------------
-
-# Initialize Session State
-if 'notional' not in st.session_state:
-    st.session_state['notional'] = 100
 
 # --- Sidebar ---
-st.sidebar.title("STIR Master Pro 📊")
-view_mode = st.sidebar.radio("Module", ["Curve Analyzer", "Strategy Lab", "Arb Scanner"])
+st.sidebar.title("STIR Desk 🏛️")
+mode = st.sidebar.radio("View", ["Term Structure", "Strategy Lab", "Spread Monitor"])
 
 st.sidebar.markdown("---")
-st.sidebar.header("Global Parameters")
-base_rate_input = st.sidebar.number_input("Current EFFR (%)", value=5.33, step=0.01)
-curve_shock = st.sidebar.slider("Market Shock Scenario (bps)", -100, 100, 0)
+st.sidebar.header("Curve Assumptions")
+base_rate = st.sidebar.number_input("Base EFFR (%)", 5.00, 6.00, 5.33)
+shock = st.sidebar.slider("Curve Shock (bps)", -50, 50, 0)
+st.sidebar.caption("Adjust 'Shock' to stress-test your Flys.")
 
-# Load Data
-df = fetch_stir_data(base_rate_input, curve_shock)
+# --- Load Data ---
+df = fetch_stir_data(base_rate, shock)
 
-# --- Main Dashboard ---
+st.title("STIR Trading Dashboard")
+st.caption(f"Pricing: Synthetic Live | Shock Scenario: {shock} bps")
 
-st.title(f"STIR Trading Desk")
-st.caption(f"Pricing Date: {date.today().strftime('%Y-%m-%d')} | Data Mode: Synthetic Real-Time")
-
-# Ticker Tape (Top)
-tape_cols = st.columns(6)
+# --- Top Tape ---
+cols = st.columns(6)
 for i in range(min(6, len(df))):
     row = df.iloc[i]
-    with tape_cols[i]:
+    with cols[i]:
         st.metric(
-            label=row['ZQ_Ticker'], 
-            value=f"{row['ZQ_Price']:.3f}", 
-            delta=f"{(row['ZQ_Rate'] - base_rate_input):.2f}%"
+            row['ZQ_Ticker'], 
+            f"{row['ZQ_Price']:.3f}", 
+            delta=f"{row['Arb_Basis']} bp Arb" 
         )
 
-st.markdown("---")
-
 # -----------------------------------------------------------------------------
-# 5. MODULE: CURVE ANALYZER
+# MODULE 1: TERM STRUCTURE
 # -----------------------------------------------------------------------------
-if view_mode == "Curve Analyzer":
-    col_chart, col_data = st.columns([2, 1])
+if mode == "Term Structure":
     
-    with col_chart:
-        st.subheader("Forward Term Structure")
-        
+    col_main, col_tbl = st.columns([2, 1])
+    
+    with col_main:
+        st.subheader("Implied Rates Curve")
         fig = go.Figure()
-        
-        # ZQ Curve
-        fig.add_trace(go.Scatter(
-            x=df['Expiry'], y=df['ZQ_Rate'], 
-            mode='lines+markers', name='ZQ (Fed Funds)',
-            line=dict(color='#00F0FF', width=3)
-        ))
-        
-        # SR3 Curve
-        fig.add_trace(go.Scatter(
-            x=df['Expiry'], y=df['SR3_Rate'], 
-            mode='lines+markers', name='SR3 (SOFR)',
-            line=dict(color='#FFA500', width=3, dash='dash')
-        ))
+        fig.add_trace(go.Scatter(x=df['Expiry'], y=df['ZQ_Rate'], name='ZQ (Fed Funds)', line=dict(color='#00F0FF', width=3)))
+        fig.add_trace(go.Scatter(x=df['Expiry'], y=df['SR3_Rate'], name='SR3 (SOFR)', line=dict(color='orange', width=2, dash='dash')))
         
         fig.update_layout(
-            title="Implied Rates (%)",
-            xaxis_title="Contract Month",
-            yaxis_title="Rate",
             template="plotly_dark",
-            height=500,
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            height=450,
+            margin=dict(l=20, r=20, t=40, b=20),
+            legend=dict(orientation="h", y=1.1)
         )
         st.plotly_chart(fig, use_container_width=True)
-        
-    with col_data:
-        st.subheader("Curve Data")
+
+    with col_tbl:
+        st.subheader("Market Data")
+        # FIXED: Using column_config to prevent crashing on string columns
         st.dataframe(
-            df[['Expiry', 'ZQ_Price', 'SR3_Price', 'ZQ_Rate']].style.format("{:.3f}"),
-            height=500
+            df[['Expiry', 'ZQ_Price', 'SR3_Price', 'Arb_Basis']],
+            column_config={
+                "Expiry": st.column_config.TextColumn("Contract"),
+                "ZQ_Price": st.column_config.NumberColumn("ZQ Price", format="%.3f"),
+                "SR3_Price": st.column_config.NumberColumn("SR3 Price", format="%.3f"),
+                "Arb_Basis": st.column_config.NumberColumn("Arb (bps)", format="%.1f"),
+            },
+            hide_index=True,
+            height=450
         )
 
 # -----------------------------------------------------------------------------
-# 6. MODULE: STRATEGY LAB (FLYS, SPREADS)
+# MODULE 2: STRATEGY LAB
 # -----------------------------------------------------------------------------
-elif view_mode == "Strategy Lab":
-    st.subheader("Strategy Constructor")
+elif mode == "Strategy Lab":
+    st.subheader("🧪 Strategy Constructor")
     
     c1, c2 = st.columns([1, 2])
     
     with c1:
-        st.markdown("### Build Structure")
-        strat_type = st.selectbox("Type", ["Calendar Spread", "Butterfly (Fly)", "Condor"])
-        instrument = st.selectbox("Instrument", ["ZQ", "SR3"])
+        st.info("Construct Structure")
+        strat = st.selectbox("Structure", ["Butterfly (Fly)", "Calendar Spread", "Condor"])
+        root = st.selectbox("Root", ["ZQ", "SR3"])
         
-        # Dynamic Contract Selection
-        tickers = df[f'{instrument}_Ticker'].tolist()
+        tickers = df[f'{root}_Ticker'].tolist()
+        belly = st.selectbox("Center / Front Leg", tickers, index=2)
         
+        # Logic for Legs
         legs = []
-        
-        if strat_type == "Calendar Spread":
-            leg1 = st.selectbox("Front Leg (Buy)", tickers, index=0)
-            leg2 = st.selectbox("Back Leg (Sell)", tickers, index=2)
-            
-            p1 = df.loc[df[f'{instrument}_Ticker'] == leg1, f'{instrument}_Price'].values[0]
-            p2 = df.loc[df[f'{instrument}_Ticker'] == leg2, f'{instrument}_Price'].values[0]
-            
-            legs = [(1, p1, leg1), (-1, p2, leg2)]
-            
-        elif strat_type == "Butterfly (Fly)":
-            # Fly = Long Wing, Short 2x Belly, Long Wing
-            belly = st.selectbox("Belly (Center)", tickers, index=2)
-            width = st.slider("Wing Width (Months)", 1, 3, 1)
-            
-            try:
-                idx = tickers.index(belly)
-                wing1 = tickers[idx - width]
-                wing2 = tickers[idx + width]
-                
-                p_belly = df.loc[df[f'{instrument}_Ticker'] == belly, f'{instrument}_Price'].values[0]
-                p_w1 = df.loc[df[f'{instrument}_Ticker'] == wing1, f'{instrument}_Price'].values[0]
-                p_w2 = df.loc[df[f'{instrument}_Ticker'] == wing2, f'{instrument}_Price'].values[0]
-                
-                legs = [(1, p_w1, wing1), (-2, p_belly, belly), (1, p_w2, wing2)]
-                
-            except IndexError:
-                st.error("Structure out of bounds. Move Belly to center of curve.")
+        try:
+            idx = tickers.index(belly)
+            if strat == "Butterfly (Fly)":
+                width = st.slider("Fly Width (Months)", 1, 3, 1)
+                w1 = tickers[idx - width]
+                w2 = tickers[idx + width]
+                legs = [
+                    (1, df.loc[df[f'{root}_Ticker']==w1, f'{root}_Price'].values[0], w1),
+                    (-2, df.loc[df[f'{root}_Ticker']==belly, f'{root}_Price'].values[0], belly),
+                    (1, df.loc[df[f'{root}_Ticker']==w2, f'{root}_Price'].values[0], w2)
+                ]
+            elif strat == "Calendar Spread":
+                back = tickers[idx + 1]
+                legs = [
+                    (1, df.loc[df[f'{root}_Ticker']==belly, f'{root}_Price'].values[0], belly),
+                    (-1, df.loc[df[f'{root}_Ticker']==back, f'{root}_Price'].values[0], back)
+                ]
+        except IndexError:
+            st.error("Structure out of bounds of the curve.")
 
-        # Calculate Price
-        net_price = sum([q * p for q, p, n in legs])
-        st.metric(f"{strat_type} Price", f"{net_price:.3f}")
-        
-        # Position Sizing
-        st.markdown("### Sizing")
-        qty = st.number_input("Quantity (Lots)", value=100)
-        dv01_val = DV01_ZQ if instrument == "ZQ" else DV01_SR3
-        
-        # Net DV01
-        # Sum of abs(qty * leg_qty) is margin risk, but net DV01 is directional risk
-        net_dv01 = sum([q * dv01_val for q, p, n in legs]) * qty
-        st.write(f"**Net DV01:** ${net_dv01:.2f} / bp")
+        # Calc Price
+        if legs:
+            price = sum([q*p for q,p,n in legs])
+            st.metric(f"Net Price", f"{price:.3f}")
+            
+            qty = st.number_input("Size (Lots)", 1, 1000, 100)
+            
+            # DV01
+            unit_dv01 = DV01_ZQ if root == "ZQ" else DV01_SR3
+            net_dv01 = sum([q*unit_dv01 for q,p,n in legs]) * qty
+            st.write(f"**Net Risk:** ${net_dv01:.2f} / bp")
 
     with c2:
-        st.markdown("### Payoff Analysis")
-        
-        # Visualize "Belly" Cheapness
-        if strat_type == "Butterfly (Fly)":
-            # Extract just the relevant segment of the curve to visualize the "kink"
-            relevant_indices = [tickers.index(l[2]) for l in legs]
-            relevant_indices.sort()
-            start_i, end_i = relevant_indices[0], relevant_indices[-1]
+        if legs:
+            st.markdown("### Payoff & Curve Visual")
             
-            segment = df.iloc[start_i:end_i+1]
+            # Payoff Chart logic
+            shifts = np.linspace(-50, 50, 21) # bps
+            pnl_vals = []
+            for s in shifts:
+                # Price change approx = -1 * Shift * 100
+                # PnL = Sum(Qty * PriceChange * UnitDV01)
+                pnl = 0
+                for q, p, n in legs:
+                    pnl += (q * -(s/100) * 100 * unit_dv01) * qty
+                pnl_vals.append(pnl)
+                
+            fig_pnl = go.Figure()
+            fig_pnl.add_trace(go.Scatter(x=shifts, y=pnl_vals, fill='tozeroy', line=dict(color='green')))
+            fig_pnl.update_layout(title="PnL at Expiry vs Rate Shift", xaxis_title="Shift (bps)", yaxis_title="PnL ($)")
+            st.plotly_chart(fig_pnl, use_container_width=True)
             
-            fig_fly = go.Figure()
-            fig_fly.add_trace(go.Scatter(
-                x=segment['Expiry'], y=segment[f'{instrument}_Price'],
-                mode='lines+markers', name='Market Curve',
-                line=dict(color='yellow')
-            ))
-            
-            # Draw the Linear Interpolation (The "Fair" Value if no convexity)
-            fig_fly.add_trace(go.Scatter(
-                x=[segment.iloc[0]['Expiry'], segment.iloc[-1]['Expiry']],
-                y=[segment.iloc[0][f'{instrument}_Price'], segment.iloc[-1][f'{instrument}_Price']],
-                mode='lines', name='Linear Fair Value',
-                line=dict(color='white', dash='dot')
-            ))
-            
-            fig_fly.update_layout(title=f"Visualizing the Belly: {belly}", template="plotly_dark")
-            st.plotly_chart(fig_fly, use_container_width=True)
-
-        st.write("#### Leg Execution")
-        exec_df = pd.DataFrame(legs, columns=["Ratio", "Ref Price", "Ticker"])
-        exec_df['Total Lots'] = exec_df['Ratio'] * qty
-        st.table(exec_df)
+            # Execution Ticket
+            st.markdown("#### Execution Ticket")
+            exec_data = [{"Side": "BUY" if q>0 else "SELL", "Qty": abs(q*qty), "Contract": n, "Price": f"{p:.3f}"} for q,p,n in legs]
+            st.table(pd.DataFrame(exec_data))
 
 # -----------------------------------------------------------------------------
-# 7. MODULE: ARB SCANNER
+# MODULE 3: SPREAD MONITOR
 # -----------------------------------------------------------------------------
-elif view_mode == "Arb Scanner":
-    st.subheader("ZQ vs FOMC Meeting Dates")
-    st.info("This tool strips the ZQ price to find the implied rate between meetings.")
+elif mode == "Spread Monitor":
+    st.subheader("🔥 Hot Spreads")
     
-    col_arb1, col_arb2 = st.columns(2)
+    # Auto-generate 1-month calendar spreads
+    spreads = []
+    for i in range(len(df)-1):
+        front = df.iloc[i]
+        back = df.iloc[i+1]
+        
+        spread_price = front['ZQ_Price'] - back['ZQ_Price']
+        spread_name = f"{front['MonthCode']}/{back['MonthCode']}"
+        
+        spreads.append({
+            "Pair": spread_name,
+            "Price": spread_price,
+            "Implied": f"{front['ZQ_Rate']:.2f}% -> {back['ZQ_Rate']:.2f}%",
+            "Slope": "Inverted" if spread_price < 0 else "Steep"
+        })
+        
+    sp_df = pd.DataFrame(spreads)
     
-    with col_arb1:
-        arb_ticker = st.selectbox("Select ZQ Contract", df['ZQ_Ticker'].unique())
-        row = df[df['ZQ_Ticker'] == arb_ticker].iloc[0]
-        
-        contract_date = row['Date_Obj']
-        # Calculate weights
-        w_old, w_new = get_fomc_impact_ratio(contract_date)
-        
-        st.metric("Current Market Price", f"{row['ZQ_Price']:.3f}")
-        st.write(f"**FOMC Weighting Logic:**")
-        st.write(f"- Days at Old Rate: {w_old*100:.1f}%")
-        st.write(f"- Days at New Rate: {w_new*100:.1f}%")
-        
-        if w_new == 0:
-            st.warning("No FOMC meeting scheduled in this contract month.")
-    
-    with col_arb2:
-        st.write("### Theoretical Pricing")
-        
-        user_hike = st.select_slider("FOMC Move (bps)", options=[-50, -25, 0, 25, 50], value=-25)
-        
-        # Calculate what the price SHOULD be if that hike happens
-        # Logic: (OldRate * w_old) + ((OldRate + Hike) * w_new)
-        
-        # We assume the "Old Rate" is the current EFFR input from sidebar
-        old_rate = base_rate_input
-        new_rate = old_rate + (user_hike/100)
-        
-        fair_rate = (old_rate * w_old) + (new_rate * w_new)
-        fair_price = 100 - fair_rate
-        
-        st.metric(f"Fair Value (if {user_hike}bps)", f"{fair_price:.3f}", delta=f"{fair_price - row['ZQ_Price']:.3f}")
-        
-        st.caption("If Delta is POSITIVE (Green), Market is CHEAP (Buy). If NEGATIVE (Red), Market is RICH (Sell).")
+    col_s1, col_s2 = st.columns([1, 2])
+    with col_s1:
+        st.dataframe(
+            sp_df,
+            column_config={
+                "Price": st.column_config.NumberColumn("Spread Price", format="%.3f"),
+            },
+            hide_index=True,
+            height=600
+        )
+    with col_s2:
+        fig_sp = go.Figure()
+        fig_sp.add_trace(go.Bar(x=sp_df['Pair'], y=sp_df['Price'], name='Spread'))
+        fig_sp.update_layout(title="ZQ Calendar Spreads (1-Month Rolls)", template="plotly_dark")
+        st.plotly_chart(fig_sp, use_container_width=True)
