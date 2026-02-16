@@ -226,7 +226,7 @@ elif view_mode == "Strategy Lab":
                 leg_pnl = -1 * shift * leg_dv01 * (leg['Qty'] * lots)
                 run_pnl += leg_pnl
             
-            pnl_vals.append(run_pnl)
+            pnl_vals.append(round(run_pnl, 2))
             
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=moves, y=pnl_vals, fill='tozeroy', line=dict(color='#4CAF50' if pnl_vals[-1]>=0 else '#F44336')))
