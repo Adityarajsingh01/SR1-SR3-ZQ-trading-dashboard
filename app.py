@@ -120,39 +120,78 @@ if view_mode == "Market Overview":
 # -----------------------------------------------------------------------------
 # MODE 2: STRATEGY LAB (PRO RISK ENGINE)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# MODE 2: STRATEGY LAB (UPDATED FOR ZQ vs SR3)
+# -----------------------------------------------------------------------------
 elif view_mode == "Strategy Lab":
     st.subheader("🛠️ Strategy Constructor")
     
     c1, c2, c3 = st.columns(3)
-    strat_type = c1.selectbox("Structure", ["Calendar Spread", "Butterfly (Fly)", "Condor"])
-    prod = c2.selectbox("Product", ["ZQ", "SR3"])
-    lots = c3.number_input("Size (Lots)", 100, 10000, 100, 100)
+    # Added "ZQ vs SR3" to the list
+    strat_type = c1.selectbox("Structure", ["Calendar Spread", "Butterfly (Fly)", "Condor", "ZQ vs SR3 (Basis)"])
+    
+    # If standard strategy, pick one product. If Basis, we hide this.
+    if strat_type != "ZQ vs SR3 (Basis)":
+        prod = c2.selectbox("Product", ["ZQ", "SR3"])
+    else:
+        c2.markdown("##### 🔀 Mixed Products") # Placeholder to keep alignment
+        
+    lots = c3.number_input("Size (Lots)", 1, 10000, 100, 1)
 
     legs = []
-    tickers = df[f"{prod}_Ticker"].tolist()
-    prices = dict(zip(tickers, df[f"{prod}_Price"]))
     
-    # Strategy Logic
+    # Helper to get tickers for a specific product
+    def get_tickers(p): return df[f"{p}_Ticker"].tolist()
+    def get_price(t, p): return df.loc[df[f"{p}_Ticker"] == t, f"{p}_Price"].values[0]
+
+    # --- STRATEGY LOGIC ---
     if strat_type == "Calendar Spread":
+        tickers = get_tickers(prod)
         l1, l2 = st.columns(2)[0].selectbox("Front", tickers, 0), st.columns(2)[1].selectbox("Back", tickers, 1)
-        legs = [{"Side": "BUY", "Qty": 1, "Ticker": l1, "Price": prices[l1]}, {"Side": "SELL", "Qty": -1, "Ticker": l2, "Price": prices[l2]}]
+        legs = [
+            {"Side": "BUY", "Qty": 1, "Ticker": l1, "Price": get_price(l1, prod), "Type": prod},
+            {"Side": "SELL", "Qty": -1, "Ticker": l2, "Price": get_price(l2, prod), "Type": prod}
+        ]
         
     elif strat_type == "Butterfly (Fly)":
+        tickers = get_tickers(prod)
         cols = st.columns(3)
         w1, b, w2 = cols[0].selectbox("Wing 1", tickers, 0), cols[1].selectbox("Belly", tickers, 3), cols[2].selectbox("Wing 2", tickers, 6)
         legs = [
-            {"Side": "BUY", "Qty": 1, "Ticker": w1, "Price": prices[w1]},
-            {"Side": "SELL", "Qty": -2, "Ticker": b, "Price": prices[b]},
-            {"Side": "BUY", "Qty": 1, "Ticker": w2, "Price": prices[w2]}
+            {"Side": "BUY", "Qty": 1, "Ticker": w1, "Price": get_price(w1, prod), "Type": prod},
+            {"Side": "SELL", "Qty": -2, "Ticker": b, "Price": get_price(b, prod), "Type": prod},
+            {"Side": "BUY", "Qty": 1, "Ticker": w2, "Price": get_price(w2, prod), "Type": prod}
         ]
 
     elif strat_type == "Condor":
+        tickers = get_tickers(prod)
         cols = st.columns(4)
         legs_sel = [cols[i].selectbox(f"Leg {i+1}", tickers, i) for i in range(4)]
         qtys = [1, -1, -1, 1]
-        legs = [{"Side": "BUY" if q>0 else "SELL", "Qty": q, "Ticker": t, "Price": prices[t]} for q,t in zip(qtys, legs_sel)]
+        legs = [{"Side": "BUY" if q>0 else "SELL", "Qty": q, "Ticker": t, "Price": get_price(t, prod), "Type": prod} for q,t in zip(qtys, legs_sel)]
 
-    # Ticket & Risk
+    elif strat_type == "ZQ vs SR3 (Basis)":
+        st.info("ℹ️ Trading Fed Funds (ZQ) against SOFR (SR3). Standard hedge ratio is roughly 3:5.")
+        c_leg1, c_leg2 = st.columns(2)
+        
+        # Leg 1 (ZQ)
+        with c_leg1:
+            st.markdown("#### Leg 1 (ZQ)")
+            t1 = st.selectbox("ZQ Contract", get_tickers("ZQ"))
+            q1 = st.number_input("ZQ Qty", -1000, 1000, 300, 10)
+        
+        # Leg 2 (SR3)
+        with c_leg2:
+            st.markdown("#### Leg 2 (SR3)")
+            t2 = st.selectbox("SR3 Contract", get_tickers("SR3"))
+            q2 = st.number_input("SR3 Qty", -1000, 1000, -500, 10) # Default negative for spread
+            
+        legs = [
+            {"Side": "BUY" if q1>0 else "SELL", "Qty": q1/lots, "Ticker": t1, "Price": get_price(t1, "ZQ"), "Type": "ZQ"},
+            {"Side": "BUY" if q2>0 else "SELL", "Qty": q2/lots, "Ticker": t2, "Price": get_price(t2, "SR3"), "Type": "SR3"}
+        ]
+
+    # --- TICKET & RISK ---
     st.divider()
     c_tick, c_risk = st.columns([1, 2])
     
@@ -161,29 +200,35 @@ elif view_mode == "Strategy Lab":
         pkg_price = 0
         tick_data = []
         for leg in legs:
-            weight = leg['Qty'] / legs[0]['Qty']
+            # Weighted Price for package
+            weight = leg['Qty'] # Simplified weighting
             pkg_price += (leg['Price'] * weight)
-            tick_data.append({"Side": "BUY" if leg['Qty']>0 else "SELL", "Qty": abs(leg['Qty'])*lots, "Ticker": leg['Ticker'], "Price": leg['Price']})
+            tick_data.append({
+                "Side": "BUY" if leg['Qty']>0 else "SELL", 
+                "Qty": int(abs(leg['Qty'])*lots), 
+                "Ticker": leg['Ticker'], 
+                "Product": leg['Type'],
+                "Price": leg['Price']
+            })
             
         st.dataframe(pd.DataFrame(tick_data), hide_index=True, use_container_width=True)
-        st.metric("Package Price", f"{pkg_price:.3f}")
 
-        # --- PRO RISK METRICS ---
+        # --- UPDATED RISK METRICS ---
         st.markdown("---")
         st.markdown("#### 📊 Sensitivity")
         
-        # Calculate Net DV01
         net_dv01 = 0
-        current_dv01_per_lot = DV01_MAP[prod]
         
         for leg in legs:
-            leg_risk = (leg['Qty'] * lots) * -1 * current_dv01_per_lot
+            # Now we look up DV01 based on the LEG'S type, not a global variable
+            leg_val = DV01_MAP[leg['Type']] 
+            leg_risk = (leg['Qty'] * lots) * -1 * leg_val
             net_dv01 += leg_risk
             
         c_r1, c_r2 = st.columns(2)
         c_r1.metric("Net DV01 ($)", f"${net_dv01:,.0f}")
             
-        if abs(net_dv01) < (lots * 5): 
+        if abs(net_dv01) < (lots * 10): # Slightly wider tolerance for basis
             risk_type = "Neutral"
             r_color = "off"
         elif net_dv01 > 0:
@@ -202,28 +247,25 @@ elif view_mode == "Strategy Lab":
         moves = np.arange(-25, 26, 1)
         pnl_vals = []
         
-        # Center of Gravity for Twist
         center_index = (len(legs) - 1) / 2
         
         for m in moves:
             run_pnl = 0
             for i, leg in enumerate(legs):
-                leg_dv01 = DV01_MAP[prod]
+                # Critical Fix: Use Leg-Specific DV01
+                leg_dv01 = DV01_MAP[leg['Type']]
                 
                 if sim_mode == "Parallel Shift":
                     shift = m
                 else:
-                    # Centered Twist Logic
                     dist_from_center = i - center_index
                     shift = m * dist_from_center
                 
-                # PnL Calc
                 leg_pnl = -1 * shift * leg_dv01 * (leg['Qty'] * lots)
                 run_pnl += leg_pnl
             
             pnl_vals.append(round(run_pnl, 2))
             
-        # Plotly Chart
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=moves, y=pnl_vals, 
@@ -243,7 +285,7 @@ elif view_mode == "Strategy Lab":
         )
         st.plotly_chart(fig, use_container_width=True)
         
-        if sim_mode == "Curve Twist (Centered)" and abs(pnl_vals[-1]) == 0:
+        if sim_mode == "Curve Twist (Centered)" and abs(pnl_vals[-1]) <= 1.0:
              st.success("✅ Strategy is Perfectly Hedged against Curve Rotation.")
 
 # -----------------------------------------------------------------------------
