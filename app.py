@@ -201,21 +201,31 @@ elif view_mode == "Strategy Lab":
         moves = np.arange(-25, 26, 1)
         pnl_vals = []
         dv01 = DV01_MAP[prod]
-        
+        # 3. Calculate "Center of Gravity" for the trade
+        # This fixes the skew by pivoting around the middle of the structure
+        center_index = (len(legs) - 1) / 2 
+
         for m in moves:
             run_pnl = 0
             for i, leg in enumerate(legs):
-                # SHIFT LOGIC
+                # Get the DV01 for this specific contract
+                leg_dv01 = DV01_MAP[prod] 
+                
                 if sim_mode == "Parallel Shift":
+                    # Every leg moves the same amount 'm'
                     shift = m
                 else:
-                    # Non-Linear Twist: 
-                    # Use (i^1.5) to ensure equidistant Flys don't sum to zero.
-                    # This simulates 'convexity' or 'curvature' change, not just linear tilt.
-                    shift = m * (i ** 1.5) 
+                    # Curve Twist (Centered Pivot)
+                    # Front legs move DOWN, Back legs move UP (if m > 0)
+                    dist_from_center = i - center_index
+                    shift = m * dist_from_center
                 
-                # PnL = Qty * Lots * (-Shift) * DV01
-                run_pnl += (leg['Qty'] * lots) * (-shift) * dv01
+                # PnL Calculation:
+                # If Rates go UP (Shift > 0), Price goes DOWN. 
+                # We multiply by -1 to capture this inverse relationship.
+                leg_pnl = -1 * shift * leg_dv01 * (leg['Qty'] * lots)
+                run_pnl += leg_pnl
+            
             pnl_vals.append(run_pnl)
             
         fig = go.Figure()
